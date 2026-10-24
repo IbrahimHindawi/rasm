@@ -55,6 +55,14 @@
    `kayan_entity_add(&a.archetype_header.entity_count)`, so A's count grows
    and theirs stay 0.
 
+## Generic data structures
+
+Type-erased containers in rasm (element size as an argument), typed access
+through macros that fold `sizeof(T)`, and rin's generic structs imported for
+layouts (`positions: vec<vec4>` is free through rin's C backend). Generic
+procs with instruction bodies (`vec<T>push: proc<T>`) are parked: they
+would need a monomorphiser. All of it written out in decisions.rasm §5.
+
 ## What the author does not need rasm for
 
 Recorded honestly: DoD and ECS are about memory (layout, access patterns,
