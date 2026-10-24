@@ -66,8 +66,9 @@ the type.
 **I. Pointer spelling.** `*T` is the only pointer in `.rasm` files (C's
 `T*`); `[*]T` and `[]T` from imported `.rin` files are read as layouts. The
 author's point: one-element pointers and slices mean nothing to an
-assembler that never indexes through a type. Matches rin's pending
-`c-pointer-spelling.md`. Spec §2.
+assembler that never indexes through a type. A deliberate divergence from
+rin, whose pointer kinds stay as they are (the `c-pointer-spelling.md`
+rewrite was dropped). Spec §2.
 
 **Line syntax.** `;` comments, newline-terminated statements, in `.rasm`
 files; `.rin` imports keep rin's. Sharing `;`/`//` with rin for one LSP was

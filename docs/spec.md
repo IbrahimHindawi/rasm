@@ -111,10 +111,11 @@ Level tags:
 and `[]T` (a slice) so its compiler can check indexing. rasm never indexes
 through a pointer type: a pointer is used only after `mov rax, p`, and
 `[rax + rcx*4]` or `[rax].vec4.x` name their own type. So `*T` is the only
-pointer in a `.rasm` file, and it means C's `T*`. That is also where rin is
-heading: `rin/docs/c-pointer-spelling.md` proposes `*T` as the raw C pointer.
-An imported `.rin` file keeps rin's spellings; rasm reads `[*]T` as a
-pointer and `[]T` as its 16-byte layout (pointer, length), with no checks.
+pointer in a `.rasm` file, and it means C's `T*`. This diverges from rin on
+purpose: in rin `*T` is one element, and stays so. An imported `.rin` file
+keeps rin's spellings; rasm reads `*T` and `[*]T` alike as a pointer and
+`[]T` as its 16-byte layout (pointer, length), with no checks. In the data
+file every pointer kind lowers to C's `T*`, so the C is the same either way.
 
 Sizes as C on x64. The size of a type is the size of a memory operand that
 names a symbol or field of that type, so `dword ptr` is not written when the

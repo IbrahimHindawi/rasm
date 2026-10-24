@@ -33,13 +33,12 @@ Syntax rin and rasm share:
     # ...                                 C preprocessor passthrough, verbatim (rasm reads object-like #define)
     done: label = { ... }                 labels take a block
 
-Pointer spelling is **in flux**. `C:\devel\rin\docs\pointers-and-slices.md`
-(implemented 2026-10-21) has `*T` as one element and `[*]T` as the raw pointer.
-`C:\devel\rin\docs\c-pointer-spelling.md` (proposal, 2026-10-23, untracked at
-the time of writing) would swap to `*T` raw and `&T` one element. rasm has no
-bounds checks and no slices, so for rasm a pointer is a pointer; but the
-spelling rasm accepts must follow whatever rin decides, or shared declaration
-files stop parsing in one of them.
+Pointer spelling: `C:\devel\rin\docs\pointers-and-slices.md` (implemented
+2026-10-21) has `*T` as one element, `[*]T` as the raw pointer and `[]T` as a
+slice. That stays: the proposal in `c-pointer-spelling.md` to swap to `*T`
+raw and `&T` one element was dropped by the author on 2026-10-24. rasm uses
+`*T` alone for any pointer (spec §2), a deliberate divergence; imported
+`.rin` files keep rin's spellings.
 
 rasm will be an asm mode of this compiler (design.md §2). Reusable pieces in
 `src/main.c`, by line as of commit f704f43:

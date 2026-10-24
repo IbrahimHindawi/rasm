@@ -33,9 +33,10 @@ with it is rin's own rule, no platform knowledge in the compiler. So:
   struct/enum/alias/proc declaration parsing, the designated-initialiser
   parser, the expression parser (for constant expressions), `import`, and
   **the C backend itself**, for the data file;
-- rin the language does not change for rasm. When rin changes (the pending
-  pointer spelling, `docs/c-pointer-spelling.md`), rasm's parser follows
-  for free. rasm's own files use `*T` only (spec §2).
+- rin the language does not change for rasm. When rin changes, rasm's
+  parser follows for free. One deliberate divergence: rasm's own files use
+  `*T` for every pointer, where rin has `*T`, `[*]T` and `[]T` (spec §2).
+  All of them lower to C's `T*` in the data file, so the C is identical.
 
 Reusable pieces in `C:\devel\rin\src\main.c` (19,164 lines), by line as of
 commit f704f43: `TokenKind` 385, `parse_type` 2339, `parse_decl_attributes`
