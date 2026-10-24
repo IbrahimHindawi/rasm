@@ -106,8 +106,8 @@ viewport: D3D11_VIEWPORT = {
 }
 
 ; shaders
-shader_path: [*]const u8 = {}
-shader_source: [*]u8 = {}
+shader_path: *const u8 = {}
+shader_source: *u8 = {}
 shader_size: u64 = 0
 shader_code: *ID3DBlob = {}            ; compile_shader's results
 shader_errors: *ID3DBlob = {}
@@ -183,7 +183,7 @@ process_input: proc() = {
 }
 
 ; rcx: path, rdx: source, r8: size, r9: entry point, [rsp + 40]: target -> rax: the compiled code
-compile_shader: proc(path: [*]const u8, source: [*]u8, size: u64, entry: [*]const u8, target: [*]const u8) -> *ID3DBlob = {
+compile_shader: proc(path: *const u8, source: *u8, size: u64, entry: *const u8, target: *const u8) -> *ID3DBlob = {
     sub rsp, 88                        ; D3DCompile takes 11: 32 shadow + 7 * 8, and rsp lands on 16
     mov shader_code, 0
     mov shader_errors, 0

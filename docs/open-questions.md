@@ -60,8 +60,14 @@ and stack-alignment hint parked. decisions.rasm §2.
 **R. Float folding.** Whatever C allows in a static initialiser; rasm passes
 it to C. decisions.rasm §4.
 
-**C, G, I.** Settled by default: plain `again:` labels; operand size from
-the type; pointer spelling follows rin.
+**C, G.** Settled by default: plain `again:` labels; operand size from
+the type.
+
+**I. Pointer spelling.** `*T` is the only pointer in `.rasm` files (C's
+`T*`); `[*]T` and `[]T` from imported `.rin` files are read as layouts. The
+author's point: one-element pointers and slices mean nothing to an
+assembler that never indexes through a type. Matches rin's pending
+`c-pointer-spelling.md`. Spec §2.
 
 **Line syntax.** `;` comments, newline-terminated statements, in `.rasm`
 files; `.rin` imports keep rin's. Sharing `;`/`//` with rin for one LSP was

@@ -24,7 +24,7 @@
 ; Settled by default unless you object (open-questions C, G, I):
 ;   - labels are plain `again:` lines
 ;   - a typed operand takes its size from its type: `mov desc.Usage, 1` is a dword
-;   - pointer spelling follows whatever rin decides
+;   - one pointer type, `*T`; [*]T and []T only arrive in imported .rin files
 
 
 ; =============================================================================
@@ -127,7 +127,7 @@ m4_rotate: proc(out: *mat4, angle: f32, axis: *const vec3) = {
 ; same expansion already overwrote, the callee gets the wrong value.
 ; No annotation needed; it can never fire on correct code.
 
-compile_shader: proc(path: [*]const u8, source: [*]u8, size: u64, entry: [*]const u8, target: [*]const u8) -> *ID3DBlob = {
+compile_shader: proc(path: *const u8, source: *u8, size: u64, entry: *const u8, target: *const u8) -> *ID3DBlob = {
     sub rsp, 88
     invoke(D3DCompile, rdx, r8, rcx, 0, 1, r9, qword ptr [rsp + 128], 0, 0, shader_code&, shader_errors&)
     ; error: argument 3 reads rcx, but this invoke already wrote rcx
@@ -321,7 +321,7 @@ array_at: macro(out, a, idx, T) = {
 ;   - macro arguments split on commas outside <> too: map<u64, vec4>get
 
 vec: struct<T> = {
-    data: [*]T
+    data: *T
     length: u64
     capacity: u64
 }

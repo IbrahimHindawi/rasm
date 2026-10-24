@@ -102,10 +102,19 @@ Level tags:
 `asm` for layout and sizes; `check` for names.
 
     u8 u16 u32 u64  i8 i16 i32 i64  f32 f64  b32  usize
-    *T  [*]T        pointers (spelling follows rin; see context.md)
+    *T              a pointer: 8 bytes holding an address. The only pointer type
     [N]T            array; N a constant expression
     name            a struct, enum or alias
     proc(...) -> T  a proc type, for declarations and function pointers
+
+**One pointer type.** rin distinguishes `*T` (one element), `[*]T` (many)
+and `[]T` (a slice) so its compiler can check indexing. rasm never indexes
+through a pointer type: a pointer is used only after `mov rax, p`, and
+`[rax + rcx*4]` or `[rax].vec4.x` name their own type. So `*T` is the only
+pointer in a `.rasm` file, and it means C's `T*`. That is also where rin is
+heading: `rin/docs/c-pointer-spelling.md` proposes `*T` as the raw C pointer.
+An imported `.rin` file keeps rin's spellings; rasm reads `[*]T` as a
+pointer and `[]T` as its 16-byte layout (pointer, length), with no checks.
 
 Sizes as C on x64. The size of a type is the size of a memory operand that
 names a symbol or field of that type, so `dword ptr` is not written when the
