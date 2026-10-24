@@ -19,6 +19,13 @@
 - **Steps:** small ones. The archetype ECS may be overkill in rasm; it may
   be tried after the particle lesson.
 
+## Bindings
+
+Not a work item any more: `rinbind` on `windows.h`, `d3d11.h`, `dxgi.h` and
+`d3dcompiler.h` gives complete structs, `*Vtbl` structs, enums, externals and
+`#define` constants (design.md §7). What remains is choosing the
+`--filter`s and hand-writing the few call-shaped constants (`IDC_ARROW`).
+
 ## Lessons, in order
 
 1. **2.1 hello triangle** (`examples/2.1.hello_triangle`). The first file

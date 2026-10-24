@@ -178,9 +178,11 @@ field offset:
     mov r10, [rcx]
     call [r10].ID3D11DeviceVtbl.CreateBuffer    ; call qword ptr [r10 + 24]
 
-This is the ordinary `[reg].T.f` operand of §5. `rinbind` emits the `*Vtbl`
-structs; rin-dx11's hand-written binding keeps COM types opaque and would
-need them added.
+This is the ordinary `[reg].T.f` operand of §5. `rinbind` already emits the
+`*Vtbl` structs when run on the SDK headers (verified 2026-10-24: 41 of them
+from `d3d11.h`, `ID3D11DeviceVtbl.CreateBuffer` at byte 24). The hand-curated
+bindings in rin-dx11 and njinn keep COM types opaque, which suits rin but not
+rasm; rasm imports rinbind's full output instead.
 
 ### 2.5 external types
 

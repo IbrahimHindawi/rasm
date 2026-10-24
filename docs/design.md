@@ -210,11 +210,20 @@ in rin or C (kayan), hot SIMD kernels in rasm, linked together.
 - **Names.** No assembler reserved words reach anything: the `.s` quotes
   every symbol (`[rip + "offset"]`, verified), and the data's C file uses
   rin's C names. Every global keeps its own name, exported as written.
-- **Bindings.** A complete binding (every field, `*Vtbl` structs) generated
-  by `rinbind` would serve rin-dx11 and rasm both. Header constants are C
-  macros: a small libclang script (like masm64-dx11's `gen_d3d11.py`)
-  writes their evaluated values to a generated `win32_consts.rasm` of plain
-  `#define`s, and the C data file guards each with `#ifndef`.
+- **Bindings: rinbind already does it.** Run directly on the SDK headers
+  (verified 2026-10-24 on `d3d11.h`, 4,277 lines), `rinbind` writes every
+  struct complete and in order, with clang's offset of each field as a
+  comment (`// rinbind: field_offset Usage:32`, in bits: a ready reference
+  for testing rasm's layout pass); all the `*Vtbl` structs; enums with
+  values; `proc[external]` declarations; and object-like macros as
+  `#define NAME value` with casts and `L` suffixes stripped, which is the
+  constants file the header-constants decision asked for. The C data file
+  guards each `#define` with `#ifndef`. Gap: a macro whose value is a call
+  (`IDC_ARROW` is `MAKEINTRESOURCEA(32512)`) comes out as its tokens, not a
+  number; a handful, written as the number by hand. The hand-curated
+  bindings in rin-dx11 and njinn (`njinn/src/bindings/win32.rin`) are
+  partial on purpose, under `no_layout_check`, and are not what rasm
+  imports.
 - **The arena.** rasm's own arena keeps `memops_arena`'s fields in order
   (`base`, `cursor`, `previous`, `used`, `pagesize`, `npages`, `reserved`),
   so a rin program can hand its arena to a rasm kernel.
