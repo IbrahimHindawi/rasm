@@ -1,0 +1,116 @@
+; transforms: the per-draw matrices most lessons send in register b0
+;
+; From 2.1 colors on, shaders start with
+;
+;     cbuffer transforms : register(b0)
+;     {
+;         float4x4 model;
+;         float4x4 normal_matrix;
+;         float4x4 view;
+;         float4x4 projection;
+;         float3 view_position;
+;     };
+;
+; and `transforms` below mirrors it register for register. Once a frame,
+; transforms_from_camera fills in the camera's part; draw_cube then sets the
+; model matrix for one cube and draws it.
+
+import "../d3d11.rin"
+import "../calls.rasm"
+import "../math.rasm"
+import "window.rasm"
+import "gpu.rasm"
+import "camera.rasm"
+
+transforms: struct = {
+    model: mat4
+    normal_matrix: mat4                    ; inverse transpose of model, for normals
+    view: mat4
+    projection: mat4
+    view_position: vec3                    ; the eye, in world space
+    pad: f32
+}
+
+; rcx: transforms, rdx: camera
+;
+; view from the camera, projection with its zoom as the field of view (0.1 to
+; 100 units), and where the eye is.
+transforms_from_camera: proc(t: *transforms, cam: *const camera) = {
+    push rbx
+    push rsi
+    sub rsp, 40                            ; 32 shadow; entry 8 + two pushes 16 + 40 lands on 16
+    mov rbx, rcx                           ; t
+    mov rsi, rdx                           ; the camera
+    lea rcx, [rbx].transforms.view
+    invoke(camera_view, rcx, rsi)
+    lea rcx, [rbx].transforms.projection
+    invoke(camera_projection, rcx, rsi)
+    lea rax, [rsi].camera.position
+    v3load(xmm0, rax)
+    lea rax, [rbx].transforms.view_position
+    v3store(rax, xmm0)
+    add rsp, 40
+    pop rsi
+    pop rbx
+    ret
+}
+
+; rcx: constant buffer, rdx: transforms, r8: model matrix
+;
+; The model matrix and its normal matrix, sent; then the 36 vertices of the
+; cube already bound. HLSL has no inverse(), so the normal matrix is worked
+; out here, for every draw.
+draw_cube: proc(buffer: *ID3D11Buffer, t: *transforms, model: *const mat4) = {
+    push rbx
+    push rsi
+    push rdi
+    sub rsp, 32                            ; 32 shadow; entry 8 + three pushes 24 + 32 lands on 16
+    mov rbx, rcx                           ; buffer
+    mov rsi, rdx                           ; t
+    mov rdi, r8                            ; model
+    m4_copy(rsi, rdi)                      ; t.model is at offset 0
+    lea rcx, [rsi].transforms.normal_matrix
+    invoke(m4_normal_matrix, rcx, rdi)
+    invoke(update_buffer, rbx, rsi, sizeof(transforms))
+    vcall(context, ID3D11DeviceContextVtbl.Draw, 36, 0)
+    add rsp, 32
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+}
+
+; draw_vertices's: IASetVertexBuffers takes arrays of one
+draw_vertices_vb: *ID3D11Buffer = {}
+draw_vertices_stride: u32 = 32
+draw_vertices_offset: u32 = 0
+
+; rcx: constant buffer, rdx: transforms, r8: vertex buffer (32-byte vertices:
+; position, normal, uv), r9d: vertex count, [rsp + 40]: model matrix
+;
+; draw_cube for any vertex buffer: bind it, send the model and normal
+; matrices, draw.
+draw_vertices: proc(buffer: *ID3D11Buffer, t: *transforms, vb: *ID3D11Buffer, count: u32, model: *const mat4) = {
+    push rbx
+    push rsi
+    push rdi
+    push r12
+    sub rsp, 56                            ; IASetVertexBuffers: 5 past `this`, 2 on the stack: 32 + 16; entry 8 + 32 + 56 lands on 16
+    mov rbx, rcx                           ; buffer
+    mov rsi, rdx                           ; t
+    mov draw_vertices_vb, r8
+    mov r12d, r9d                          ; count
+    mov rdi, [rsp + 128]                   ; model: [rsp + 40] on entry, + 32 + 56
+    vcall(context, ID3D11DeviceContextVtbl.IASetVertexBuffers, 0, 1, draw_vertices_vb&, draw_vertices_stride&, draw_vertices_offset&)
+    m4_copy(rsi, rdi)
+    lea rcx, [rsi].transforms.normal_matrix
+    invoke(m4_normal_matrix, rcx, rdi)
+    invoke(update_buffer, rbx, rsi, sizeof(transforms))
+    vcall(context, ID3D11DeviceContextVtbl.Draw, r12, 0)
+    add rsp, 56
+    pop r12
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+}

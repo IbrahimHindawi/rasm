@@ -1,0 +1,206 @@
+; 2. Stencil testing
+;
+; The stencil buffer is eight bits per pixel, beside the depth, that shaders
+; never see. Draws can write to it and be masked by it. Here it draws an
+; outline around each cube:
+;
+;   1. draw the cubes normally, and write 1 into the stencil wherever they land
+;   2. draw them again a little larger, in one flat colour, only where the
+;      stencil is NOT 1, so only the rim that sticks out past the originals
+;
+; The second pass ignores depth, so the outline shows through everything: the
+; selected-object look of an editor. In D3D all of this is one immutable
+; depth-stencil state object per configuration, and the reference value (1)
+; is given when it is bound.
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/macros.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/cube.rasm"
+import "../../../includes/learn/camera.rasm"
+import "../../../includes/learn/transforms.rasm"
+
+plane_vertices: [48]const f32 = {
+    ; position             normal              uv
+    -5.0, -0.5,  5.0,     0.0, 1.0, 0.0,     0.0, 2.0,
+     5.0, -0.5,  5.0,     0.0, 1.0, 0.0,     2.0, 2.0,
+     5.0, -0.5, -5.0,     0.0, 1.0, 0.0,     2.0, 0.0,
+    -5.0, -0.5,  5.0,     0.0, 1.0, 0.0,     0.0, 2.0,
+     5.0, -0.5, -5.0,     0.0, 1.0, 0.0,     2.0, 0.0,
+    -5.0, -0.5, -5.0,     0.0, 1.0, 0.0,     0.0, 0.0,
+}
+
+camera_start: const vec3 = { -1.0, 1.0, 4.0 }
+positions: [2]const vec3 = {
+    { -1.0, 0.0, -1.0 },
+    {  2.0, 0.0,  0.0 },
+}
+clear_color: [4]const f32 = { 0.1, 0.1, 0.1, 1.0 }
+
+t: transforms = {}
+model: mat4 = {}
+s: shader = {}
+single_color: shader = {}
+cam: camera = {}
+cube_vb: *ID3D11Buffer = {}
+plane_vb: *ID3D11Buffer = {}
+transforms_buffer: *ID3D11Buffer = {}
+cube_texture: *ID3D11ShaderResourceView = {}
+floor_texture: *ID3D11ShaderResourceView = {}
+sampler: *ID3D11SamplerState = {}
+plain_state: *ID3D11DepthStencilState = {}     ; depth as usual, stencil untouched
+mark_state: *ID3D11DepthStencilState = {}      ; depth as usual, and the reference value written into the stencil
+outside_state: *ID3D11DepthStencilState = {}   ; no depth, and only where the stencil is not the reference value
+
+; timing
+delta_time: f32 = 0.0
+last_frame: f32 = 0.0
+
+; create_stencil_state's. What the three states share is the initialiser;
+; the code fills in the depth test, the write mask and the comparison. The
+; stencil passes REPLACE: where a draw passes, the reference value given at
+; OMSetDepthStencilState is written (if the write mask lets it).
+create_stencil_state_desc: D3D11_DEPTH_STENCIL_DESC = {
+    .DepthWriteMask = D3D11_DEPTH_WRITE_MASK.D3D11_DEPTH_WRITE_MASK_ALL,
+    .DepthFunc = D3D11_COMPARISON_FUNC.D3D11_COMPARISON_LESS,
+    .StencilEnable = 1,
+    .StencilReadMask = D3D11_DEFAULT_STENCIL_READ_MASK,
+    .FrontFace = {
+        .StencilFailOp = D3D11_STENCIL_OP.D3D11_STENCIL_OP_KEEP,
+        .StencilDepthFailOp = D3D11_STENCIL_OP.D3D11_STENCIL_OP_KEEP,
+        .StencilPassOp = D3D11_STENCIL_OP.D3D11_STENCIL_OP_REPLACE,
+    },
+    .BackFace = {                          ; the back faces the same
+        .StencilFailOp = D3D11_STENCIL_OP.D3D11_STENCIL_OP_KEEP,
+        .StencilDepthFailOp = D3D11_STENCIL_OP.D3D11_STENCIL_OP_KEEP,
+        .StencilPassOp = D3D11_STENCIL_OP.D3D11_STENCIL_OP_REPLACE,
+    },
+}
+create_stencil_state_out: *ID3D11DepthStencilState = {}
+
+; ecx: stencil comparison, edx: 1 to write the stencil, r8d: 1 to test depth
+; -> rax: the state
+create_stencil_state: proc(func: D3D11_COMPARISON_FUNC, write: b32, depth: b32) -> *ID3D11DepthStencilState = {
+    sub rsp, 40                            ; 32 shadow, and rsp back on 16
+    mov create_stencil_state_desc.DepthEnable, r8d
+    mov create_stencil_state_desc.FrontFace.StencilFunc, ecx
+    mov create_stencil_state_desc.BackFace.StencilFunc, ecx
+    ; StencilWriteMask is a UINT8, so its store is a byte: al
+    xor eax, eax
+    test edx, edx
+    jz no_write
+    mov eax, D3D11_DEFAULT_STENCIL_WRITE_MASK
+  no_write:
+    mov create_stencil_state_desc.StencilWriteMask, al
+    vcall(device, ID3D11DeviceVtbl.CreateDepthStencilState, create_stencil_state_desc&, create_stencil_state_out&)
+    assert_hr()
+    mov rax, create_stencil_state_out
+    add rsp, 40
+    ret
+}
+
+main: proc() -> i32 = {
+    push rbx
+    push rsi
+    sub rsp, 40                            ; draw_vertices takes 5: 32 + 8; entry 8 + two pushes 16 + 40 lands on 16
+
+    invoke(window_create, "LearnD3D11")
+    call window_create_depth
+
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP)
+    mov sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 0, 1, sampler&)
+
+    invoke(shader_create, s&, "src/4.advanced_d3d11/2.stencil_testing/stencil_testing.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+    invoke(shader_create, single_color&, "src/4.advanced_d3d11/2.stencil_testing/single_color.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, cube_vertices&, sizeof(cube_vertices))
+    mov cube_vb, rax
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, plane_vertices&, sizeof(plane_vertices))
+    mov plane_vb, rax
+    invoke(create_constant_buffer, sizeof(transforms))
+    mov transforms_buffer, rax
+    invoke(filesystem_path, "resources/textures/marble.jpg")
+    invoke(load_texture, rax, 0)
+    mov cube_texture, rax
+    invoke(filesystem_path, "resources/textures/metal.png")
+    invoke(load_texture, rax, 0)
+    mov floor_texture, rax
+
+    lea rcx, cam
+    lea rdx, camera_start
+    movss xmm2, -75.0                      ; yaw
+    movss xmm3, -15.0                      ; pitch
+    call camera_create
+
+    invoke(create_stencil_state, D3D11_COMPARISON_FUNC.D3D11_COMPARISON_ALWAYS, 0, 1)
+    mov plain_state, rax
+    invoke(create_stencil_state, D3D11_COMPARISON_FUNC.D3D11_COMPARISON_ALWAYS, 1, 1)
+    mov mark_state, rax
+    invoke(create_stencil_state, D3D11_COMPARISON_FUNC.D3D11_COMPARISON_NOT_EQUAL, 0, 0)
+    mov outside_state, rax
+
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    call get_time
+    movss xmm1, xmm0
+    subss xmm0, last_frame
+    movss delta_time, xmm0
+    movss last_frame, xmm1
+
+    invoke(camera_process_input, cam&, delta_time&)
+
+    invoke(window_begin, clear_color&)
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    invoke(bind_constants, 0, transforms_buffer)
+    invoke(transforms_from_camera, t&, cam&)
+    invoke(shader_use, s&)
+
+    ; the floor, leaving the stencil alone
+    vcall(context, ID3D11DeviceContextVtbl.OMSetDepthStencilState, plain_state, 0)
+    invoke(bind_texture, 0, floor_texture)
+    invoke(m4_identity, model&)
+    invoke(draw_vertices, transforms_buffer, t&, plane_vb, 6, model&)
+
+    ; 1. the cubes, writing 1 into the stencil
+    vcall(context, ID3D11DeviceContextVtbl.OMSetDepthStencilState, mark_state, 1)
+    invoke(bind_texture, 0, cube_texture)
+    lea rsi, positions
+    xor ebx, ebx
+  cubes:
+    invoke(m4_translate, model&, rsi)
+    invoke(draw_vertices, transforms_buffer, t&, cube_vb, 36, model&)
+    add rsi, sizeof(vec3)
+    inc ebx
+    cmp ebx, 2
+    jb cubes
+
+    ; 2. a little larger, flat, only where the stencil is not 1: the rim
+    vcall(context, ID3D11DeviceContextVtbl.OMSetDepthStencilState, outside_state, 1)
+    invoke(shader_use, single_color&)
+    lea rsi, positions
+    xor ebx, ebx
+  outlines:
+    lea rcx, model
+    mov rdx, rsi
+    movss xmm2, 1.1                        ; the scale, the third argument
+    call m4_translate_scale
+    invoke(draw_vertices, transforms_buffer, t&, cube_vb, 36, model&)
+    add rsi, sizeof(vec3)
+    inc ebx
+    cmp ebx, 2
+    jb outlines
+    vcall(context, ID3D11DeviceContextVtbl.OMSetDepthStencilState, 0, 0)
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

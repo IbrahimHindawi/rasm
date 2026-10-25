@@ -1,0 +1,123 @@
+; wall: a square with tangents, for normal and parallax mapping
+;
+; Two triangles from (-1, -1) to (1, 1) at z = 0, facing +z. Each vertex is a
+; position, a normal, a texture coordinate and a tangent: 44 bytes, described
+; by `wall_layout`.
+;
+; The tangent of a triangle is the direction in which u grows. It is solved
+; for from how position and uv change along two of its edges; both triangles
+; of a flat square share it.
+;
+;     e1 = p1 - p0,  e2 = p2 - p0,  (du1, dv1), (du2, dv2) the uv changes along them
+;     tangent = normalize((e1 dv2 - e2 dv1) / (du1 dv2 - du2 dv1))
+
+import "../d3d11.rin"
+import "../calls.rasm"
+import "../math.rasm"
+import "gpu.rasm"
+
+#define WALL_STRIDE 44
+#define WALL_LAYOUT_COUNT 4
+; six vertices of 11 floats
+#define WALL_FLOATS 66
+
+wall_layout: [WALL_LAYOUT_COUNT]const D3D11_INPUT_ELEMENT_DESC = {
+    { .SemanticName = "POSITION", .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32B32_FLOAT, .AlignedByteOffset = 0 },
+    { .SemanticName = "NORMAL", .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32B32_FLOAT, .AlignedByteOffset = 12 },
+    { .SemanticName = "TEXCOORD", .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32_FLOAT, .AlignedByteOffset = 24 },
+    { .SemanticName = "TANGENT", .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32B32_FLOAT, .AlignedByteOffset = 32 },
+}
+
+; the four corners and their texture coordinates
+wall_corners: [4]const vec3 = { { -1.0, -1.0, 0.0 }, { 1.0, -1.0, 0.0 }, { 1.0, 1.0, 0.0 }, { -1.0, 1.0, 0.0 } }
+wall_uvs: [4]const vec2 = { { 0.0, 1.0 }, { 1.0, 1.0 }, { 1.0, 0.0 }, { 0.0, 0.0 } }
+; which corner each of the six vertices is
+wall_order: [6]const u32 = { 0, 1, 2, 0, 2, 3 }
+
+; create_wall's
+wall_e1: vec3 = {}
+wall_e2: vec3 = {}
+wall_tangent: vec3 = {}
+wall_f: f32 = 0.0
+wall_vertices: [WALL_FLOATS]f32 = {}
+
+; -> rax: the wall's vertex buffer, six vertices
+create_wall: proc() -> *ID3D11Buffer = {
+    push rbx
+    push rsi
+    push rdi
+    sub rsp, 32                            ; 32 shadow; entry 8 + three pushes 24 + 32 lands on 16
+    ; edges
+    lea rcx, wall_e1
+    lea rdx, wall_corners[1]
+    lea r8, wall_corners[0]
+    call v3_sub
+    lea rcx, wall_e2
+    lea rdx, wall_corners[2]
+    lea r8, wall_corners[0]
+    call v3_sub
+    ; du1 = xmm0, dv1 = xmm1, du2 = xmm2, dv2 = xmm3
+    movss xmm0, wall_uvs[1].x
+    subss xmm0, wall_uvs[0].x
+    movss xmm1, wall_uvs[1].y
+    subss xmm1, wall_uvs[0].y
+    movss xmm2, wall_uvs[2].x
+    subss xmm2, wall_uvs[0].x
+    movss xmm3, wall_uvs[2].y
+    subss xmm3, wall_uvs[0].y
+    ; f = 1 / (du1 dv2 - du2 dv1)
+    movss xmm4, xmm0
+    mulss xmm4, xmm3
+    movss xmm5, xmm2
+    mulss xmm5, xmm1
+    subss xmm4, xmm5
+    movss xmm5, math_one
+    divss xmm5, xmm4
+    movss wall_f, xmm5
+    ; tangent = normalize((e1 dv2 - e2 dv1) f)
+    v3load_var(xmm4, wall_e1)
+    splat(xmm3)
+    mulps xmm4, xmm3
+    v3load_var(xmm5, wall_e2)
+    splat(xmm1)
+    mulps xmm5, xmm1
+    subps xmm4, xmm5
+    movss xmm5, wall_f
+    splat(xmm5)
+    mulps xmm4, xmm5
+    v3store_var(wall_tangent, xmm4)
+    lea rcx, wall_tangent
+    mov rdx, rcx
+    call v3_normalize
+
+    ; six vertices: position, normal (0, 0, 1), uv, tangent
+    lea rdi, wall_vertices
+    lea rsi, wall_order
+    xor ebx, ebx
+  each_vertex:
+    mov eax, [rsi + rbx * 4]               ; the corner
+    lea rcx, wall_corners
+    imul edx, eax, sizeof(vec3)
+    add rcx, rdx
+    v3load(xmm0, rcx)
+    v3store(rdi, xmm0)
+    mov dword ptr [rdi + 12], 0
+    mov dword ptr [rdi + 16], 0
+    mov dword ptr [rdi + 20], 0x3F800000   ; 1.0
+    lea rcx, wall_uvs
+    mov rdx, [rcx + rax * 8]               ; both of the corner's uv floats at once
+    mov [rdi + 24], rdx
+    v3load_var(xmm0, wall_tangent)
+    lea rcx, [rdi + 32]
+    v3store(rcx, xmm0)
+    add rdi, WALL_STRIDE
+    inc ebx
+    cmp ebx, 6
+    jb each_vertex
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, wall_vertices&, sizeof(wall_vertices))
+    add rsp, 32
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+}

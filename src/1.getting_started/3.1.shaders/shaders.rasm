@@ -1,0 +1,132 @@
+; 3.1 Shaders
+;
+; Two ways to get data into a shader:
+;
+;   * per vertex: each vertex carries a colour, and the rasterizer blends the
+;     three across the triangle on its way to the pixel shader (right)
+;   * per draw: a constant buffer, D3D's uniform. The CPU fills a struct and
+;     copies it in whole with Map; every vertex and pixel of the draw reads the
+;     same values (left: a tint that pulses over time)
+;
+; From here on shaders are loaded by includes/learn/shader.rasm, which does
+; what 2.1 wrote out: compile vs_main and ps_main from one .hlsl file and
+; create the input layout against the vertex shader. LearnOpenGL's 3.3
+; shaders_class introduces its Shader class the same way. The window, device
+; and swap chain, written out in 1.1 and 2.1, come from
+; includes/learn/window.rasm, which is to these lessons what GLFW is to
+; LearnOpenGL's.
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+
+; x, y, z, then r, g, b
+left_triangle: [18]const f32 = {
+    -0.9, -0.5, 0.0,   1.0, 1.0, 1.0,
+    -0.1, -0.5, 0.0,   1.0, 1.0, 1.0,
+    -0.5,  0.5, 0.0,   1.0, 1.0, 1.0,
+}
+right_triangle: [18]const f32 = {
+    0.1, -0.5, 0.0,   1.0, 0.0, 0.0,
+    0.9, -0.5, 0.0,   0.0, 1.0, 0.0,
+    0.5,  0.5, 0.0,   0.0, 0.0, 1.0,
+}
+
+vertex_layout: [2]const D3D11_INPUT_ELEMENT_DESC = {
+    { .SemanticName = "POSITION", .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32B32_FLOAT, .AlignedByteOffset = 0 },
+    { .SemanticName = "COLOR", .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32B32_FLOAT, .AlignedByteOffset = 12 },
+}
+clear_color: [4]const f32 = { 0.2, 0.3, 0.3, 1.0 }
+
+; Mirrors `cbuffer frame` in the shader, register for register.
+frame_constants: struct = {
+    tint: vec4
+}
+
+s: shader = {}
+c: frame_constants = {}
+left_vb: *ID3D11Buffer = {}
+right_vb: *ID3D11Buffer = {}
+constants: *ID3D11Buffer = {}
+stride: u32 = 24
+offset: u32 = 0
+
+; timing
+current_frame: f32 = 0.0
+
+main: proc() -> i32 = {
+    sub rsp, 56                            ; IASetVertexBuffers takes 6: 32 + 16, plus 8 to land on 16
+
+    invoke(window_create, "LearnD3D11")
+
+    ; build and compile our shader program
+    ; ------------------------------------
+    invoke(shader_create, s&, "src/1.getting_started/3.1.shaders/shaders.hlsl", vertex_layout&, 2)
+
+    ; set up vertex data
+    ; ------------------
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, left_triangle&, sizeof(left_triangle))
+    mov left_vb, rax
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, right_triangle&, sizeof(right_triangle))
+    mov right_vb, rax
+
+    ; A dynamic constant buffer: the CPU may rewrite it. Its size must be a
+    ; multiple of 16 bytes, the size of one HLSL register.
+    invoke(create_constant_buffer, sizeof(frame_constants))
+    mov constants, rax
+
+    ; render loop
+    ; -----------
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    ; per-frame time logic
+    ; --------------------
+    call get_time
+    movss current_frame, xmm0
+
+    ; render
+    ; ------
+    vcall(context, ID3D11DeviceContextVtbl.OMSetRenderTargets, 1, backbuffer_rtv&, 0)
+    vcall(context, ID3D11DeviceContextVtbl.RSSetViewports, 1, viewport&)
+    vcall(context, ID3D11DeviceContextVtbl.ClearRenderTargetView, backbuffer_rtv, clear_color&)
+
+    invoke(shader_use, s&)
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    vcall(context, ID3D11DeviceContextVtbl.PSSetConstantBuffers, 0, 1, constants&)
+
+    ; WRITE_DISCARD hands back fresh memory each time, so the GPU never waits
+    ; on the CPU, and the previous draw keeps the values it saw.
+    ; tint = (0, sin(t) / 2 + 0.5, 0, 1)
+    movss xmm0, current_frame
+    call sinf
+    mulss xmm0, 0.5
+    addss xmm0, 0.5
+    mov c.tint.x, 0
+    movss c.tint.y, xmm0
+    mov c.tint.z, 0
+    mov c.tint.w, 0x3F800000               ; 1.0, as bits: a float immediate is written as its bits
+    invoke(update_buffer, constants, c&, sizeof(frame_constants))
+    vcall(context, ID3D11DeviceContextVtbl.IASetVertexBuffers, 0, 1, left_vb&, stride&, offset&)
+    vcall(context, ID3D11DeviceContextVtbl.Draw, 3, 0)
+
+    movss xmm0, 1.0
+    movss c.tint.x, xmm0
+    movss c.tint.y, xmm0
+    movss c.tint.z, xmm0
+    invoke(update_buffer, constants, c&, sizeof(frame_constants))
+    vcall(context, ID3D11DeviceContextVtbl.IASetVertexBuffers, 0, 1, right_vb&, stride&, offset&)
+    vcall(context, ID3D11DeviceContextVtbl.Draw, 3, 0)
+
+    ; dxgi: show the image just drawn, waiting for the next vertical blank
+    ; --------------------------------------------------------------------
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

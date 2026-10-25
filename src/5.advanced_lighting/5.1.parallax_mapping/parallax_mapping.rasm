@@ -1,0 +1,157 @@
+; 5.1 Parallax mapping
+;
+; Normal mapping changes how a flat surface is lit, but not where its texture
+; appears: seen at an angle, the bricks still look painted on. A depth map (how
+; far below the surface each texel is) lets the pixel shader shift the texture
+; coordinate to where the eye ray would really have hit the sunken surface.
+; Near bricks then hide the mortar behind them.
+;
+;   1 normal mapping only
+;   2 parallax           one shift, by the depth at the original point. Cheap;
+;                        falls apart at steep angles
+;   3 steep parallax     walk along the eye ray in layers until it goes below
+;                        the surface. Correct, but shows the layers
+;   4 occlusion          as 3, then interpolate between the last two layers
+;
+; Everything happens in tangent space, where the surface is the xy plane and
+; depth is -z, so the eye direction is turned into it first. The wall is 4.
+; normal mapping's, from includes/learn/wall.rasm.
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/cube.rasm"
+import "../../../includes/learn/camera.rasm"
+import "../../../includes/learn/transforms.rasm"
+import "../../../includes/learn/srgb.rasm"
+import "../../../includes/learn/wall.rasm"
+
+; Mirrors `cbuffer light` in parallax_mapping.hlsl.
+light_constants: struct = {
+    position: vec3
+    mode: u32                              ; 1 normal only, 2 parallax, 3 steep, 4 occlusion
+}
+
+camera_start: const vec3 = { 1.3, 0.2, 2.2 }
+clear_color: [4]const f32 = { 0.1, 0.1, 0.1, 1.0 }
+lamp_color: const vec4 = { 1.0, 1.0, 1.0, 1.0 }
+
+t: transforms = {}
+light: light_constants = { .position = { 0.5, 1.0, 0.3 }, .mode = 4 }
+model: mat4 = {}
+s: shader = {}
+lamp_shader: shader = {}
+cam: camera = {}
+cube_vb: *ID3D11Buffer = {}
+wall_vb: *ID3D11Buffer = {}
+transforms_buffer: *ID3D11Buffer = {}
+light_buffer: *ID3D11Buffer = {}
+lamp_buffer: *ID3D11Buffer = {}
+sampler: *ID3D11SamplerState = {}
+maps: [3]*ID3D11ShaderResourceView = {}    ; colour, normals, depth: t0..t2
+wall_vertex_stride: u32 = WALL_STRIDE
+wall_offset: u32 = 0
+
+; timing
+delta_time: f32 = 0.0
+last_frame: f32 = 0.0
+
+main: proc() -> i32 = {
+    sub rsp, 56                            ; IASetVertexBuffers: 5 past `this`, 2 on the stack: 32 + 16, plus 8 to land on 16
+
+    invoke(window_create, "LearnD3D11  (1 normal, 2 parallax, 3 steep, 4 occlusion)")
+    ; The back buffer is viewed as sRGB: what the shaders write is linear, and
+    ; the view gamma-encodes it on the way in (5.2).
+    call window_use_srgb
+    call window_create_depth
+    invoke(window_mode_default, 3)         ; parallax occlusion
+
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP)
+    mov sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 0, 1, sampler&)
+
+    ; build and compile shaders
+    ; -------------------------
+    invoke(shader_create, s&, "src/5.advanced_lighting/5.1.parallax_mapping/parallax_mapping.hlsl", wall_layout&, WALL_LAYOUT_COUNT)
+    invoke(shader_create, lamp_shader&, "src/5.advanced_lighting/5.1.parallax_mapping/light_cube.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+
+    ; set up vertex data and textures
+    ; -------------------------------
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, cube_vertices&, sizeof(cube_vertices))
+    mov cube_vb, rax
+    call create_wall
+    mov wall_vb, rax
+    invoke(create_constant_buffer, sizeof(transforms))
+    mov transforms_buffer, rax
+    invoke(create_constant_buffer, sizeof(light_constants))
+    mov light_buffer, rax
+    invoke(create_constant_buffer, sizeof(vec4))
+    mov lamp_buffer, rax
+    ; colour (sRGB), normals and depth (data, linear)
+    invoke(filesystem_path, "resources/textures/bricks2.jpg")
+    invoke(load_texture, rax, 1)
+    mov maps[0], rax
+    invoke(filesystem_path, "resources/textures/bricks2_normal.jpg")
+    invoke(load_texture, rax, 0)
+    mov maps[1], rax
+    invoke(filesystem_path, "resources/textures/bricks2_disp.jpg")
+    invoke(load_texture, rax, 0)
+    mov maps[2], rax
+
+    lea rcx, cam
+    lea rdx, camera_start
+    movss xmm2, -120.0                     ; yaw
+    movss xmm3, -5.0                       ; pitch
+    call camera_create
+
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    call get_time
+    movss xmm1, xmm0
+    subss xmm0, last_frame
+    movss delta_time, xmm0
+    movss last_frame, xmm1
+
+    invoke(camera_process_input, cam&, delta_time&)
+    invoke(window_mode, 4)
+    inc eax                                ; modes count from 1 in the shader
+    mov light.mode, eax
+
+    invoke(window_begin, clear_color&)
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    invoke(bind_constants, 0, transforms_buffer)
+    invoke(transforms_from_camera, t&, cam&)
+
+    invoke(update_buffer, light_buffer, light&, sizeof(light_constants))
+    invoke(shader_use, s&)
+    invoke(bind_constants, 1, light_buffer)
+    vcall(context, ID3D11DeviceContextVtbl.PSSetShaderResources, 0, 3, maps&)
+
+    ; the wall, where it was made
+    invoke(m4_identity, t.model&)
+    invoke(m4_identity, t.normal_matrix&)
+    invoke(update_buffer, transforms_buffer, t&, sizeof(transforms))
+    vcall(context, ID3D11DeviceContextVtbl.IASetVertexBuffers, 0, 1, wall_vb&, wall_vertex_stride&, wall_offset&)
+    vcall(context, ID3D11DeviceContextVtbl.Draw, 6, 0)
+
+    ; the lamp
+    invoke(update_buffer, lamp_buffer, lamp_color&, sizeof(vec4))
+    invoke(shader_use, lamp_shader&)
+    invoke(bind_constants, 1, lamp_buffer)
+    lea rcx, model
+    lea rdx, light.position
+    movss xmm2, 0.05
+    call m4_translate_scale
+    invoke(draw_vertices, transforms_buffer, t&, cube_vb, 36, model&)
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

@@ -1,0 +1,320 @@
+; 8.1 Deferred shading
+;
+; Forward rendering lights every pixel of every object as it is drawn, even the
+; ones later covered: with many lights that is a lot of wasted lighting.
+; Deferred rendering splits it in two:
+;
+;   geometry pass  draw everything once, storing what lighting needs rather
+;                  than the lit colour: world position, normal, albedo and
+;                  specular strength, in three targets at once (the G-buffer)
+;   lighting pass  one full-screen pass reads the G-buffer and lights each
+;                  visible pixel exactly once, here by 32 lights
+;
+; What deferred cannot do is blend, so anything transparent (or, here, the
+; light cubes) is drawn forward afterwards. Those still need the depth the
+; geometry pass left behind, so the G-buffer's depth buffer is bound together
+; with the back buffer for them; GL has to copy it across with a blit.
+;
+; The albedo target is an _SRGB format: linear colour stored with the sRGB
+; curve, so its eight bits go where the eye can tell the difference.
+;
+;   Tab   lit / positions / normals / albedo / specular
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/cube.rasm"
+import "../../../includes/learn/camera.rasm"
+import "../../../includes/learn/transforms.rasm"
+import "../../../includes/learn/model.rasm"
+import "../../../includes/learn/srgb.rasm"
+
+#define LIGHT_COUNT 32
+
+point_light: struct = {
+    position: vec4
+    color: vec4
+}
+
+; Mirrors `cbuffer lights` in deferred_shading.hlsl: the lights, then which
+; view to show. (masm64-dx11 laid this out by hand, as MASM cannot initialise
+; an array of structures inside a structure; here it is a struct like any
+; other.)
+lights_constants: struct = {
+    lights: [LIGHT_COUNT]point_light
+    view_mode: u32
+    pad: [3]u32
+}
+
+camera_start: const vec3 = { 0.0, 4.0, 9.0 }
+no_color: [4]const f32 = { 0.0, 0.0, 0.0, 0.0 }
+black: [4]const f32 = { 0.0, 0.0, 0.0, 1.0 }
+
+backpack_place: vec3 = {}
+lights: lights_constants = {}
+t: transforms = {}
+lamp_color: vec4 = {}
+lamp_model: mat4 = {}
+geometry_shader: shader = {}
+lighting_shader: shader = {}
+lamp_shader: shader = {}
+cam: camera = {}
+backpack: model = {}
+positions: render_target = {}
+normals: render_target = {}
+albedo: render_target = {}
+g_targets: [3]*ID3D11RenderTargetView = {}     ; bound together for the geometry pass
+g_views: [3]*ID3D11ShaderResourceView = {}     ; read together by the lighting pass
+g_depth: *ID3D11DepthStencilView = {}
+cube_vb: *ID3D11Buffer = {}
+transforms_buffer: *ID3D11Buffer = {}
+lights_buffer: *ID3D11Buffer = {}
+lamp_buffer: *ID3D11Buffer = {}
+sampler: *ID3D11SamplerState = {}
+
+; timing
+current_frame: f32 = 0.0
+delta_time: f32 = 0.0
+last_frame: f32 = 0.0
+
+; random_in's (MASM's `local`s): rand may not keep xmm1 and xmm2
+random_in_scale: f32 = 0.0
+random_in_offset: f32 = 0.0
+
+; xmm1: scale, xmm2: offset -> xmm0: (rand() % 1000) / 1000 * scale + offset
+random_in: proc(unused: u32, scale: f32, offset: f32) -> f32 = {
+    sub rsp, 40                            ; 32 shadow, and rsp back on 16
+    movss random_in_scale, xmm1
+    movss random_in_offset, xmm2
+    call rand
+    xor edx, edx
+    mov ecx, 1000
+    div ecx
+    cvtsi2ss xmm0, edx
+    divss xmm0, 1000.0
+    mulss xmm0, random_in_scale
+    addss xmm0, random_in_offset
+    add rsp, 40
+    ret
+}
+
+main: proc() -> i32 = {
+    push rbx
+    push rsi
+    push rdi
+    sub rsp, 48                            ; 5-argument calls (draw_vertices, create_render_target): 32 + 8; entry 8 + 24 + 48 lands on 16
+
+    invoke(window_create, "LearnD3D11  (Tab: lit / position / normal / albedo / specular)")
+    ; The back buffer is viewed as sRGB: what the shaders write is linear, and
+    ; the view gamma-encodes it on the way in (5.2).
+    call window_use_srgb
+    call window_create_depth
+
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP)
+    mov sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 0, 1, sampler&)
+
+    ; build and compile shaders
+    ; -------------------------
+    invoke(shader_create, geometry_shader&, "src/5.advanced_lighting/8.1.deferred_shading/g_buffer.hlsl", model_layout&, MODEL_LAYOUT_COUNT)
+    invoke(shader_create, lighting_shader&, "src/5.advanced_lighting/8.1.deferred_shading/deferred_shading.hlsl", 0, 0)
+    invoke(shader_create, lamp_shader&, "src/5.advanced_lighting/8.1.deferred_shading/light_cube.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+
+    ; load models
+    ; -----------
+    invoke(model_load, backpack&, "resources/objects/backpack/", "backpack.obj", 0)
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, cube_vertices&, sizeof(cube_vertices))
+    mov cube_vb, rax
+    invoke(create_constant_buffer, sizeof(transforms))
+    mov transforms_buffer, rax
+    invoke(create_constant_buffer, sizeof(lights_constants))
+    mov lights_buffer, rax
+    invoke(create_constant_buffer, sizeof(vec4))
+    mov lamp_buffer, rax
+
+    lea rcx, cam
+    lea rdx, camera_start
+    movss xmm2, -90.0                      ; yaw
+    movss xmm3, -25.0                      ; pitch
+    call camera_create
+
+    ; configure g-buffer framebuffer
+    ; ------------------------------
+    invoke(create_render_target, positions&, SCR_WIDTH, SCR_HEIGHT, DXGI_FORMAT.DXGI_FORMAT_R16G16B16A16_FLOAT, 1)
+    invoke(create_render_target, normals&, SCR_WIDTH, SCR_HEIGHT, DXGI_FORMAT.DXGI_FORMAT_R16G16B16A16_FLOAT, 1)
+    invoke(create_render_target, albedo&, SCR_WIDTH, SCR_HEIGHT, DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 1)
+    invoke(create_depth_buffer, SCR_WIDTH, SCR_HEIGHT, 1)
+    mov g_depth, rax
+    mov rax, positions.rtv
+    mov g_targets[0], rax
+    mov rax, normals.rtv
+    mov g_targets[1], rax
+    mov rax, albedo.rtv
+    mov g_targets[2], rax
+    mov rax, positions.srv
+    mov g_views[0], rax
+    mov rax, normals.srv
+    mov g_views[1], rax
+    mov rax, albedo.srv
+    mov g_views[2], rax
+
+    ; lighting info: 32 lights scattered around the backpacks, in pale random colours
+    ; -------------
+    invoke(srand, 13)
+    lea rsi, lights.lights
+    xor ebx, ebx
+  place_lights:
+    ; The rin original draws these as v4(random(), random(), random(), 0),
+    ; whose arguments its compiler (clang-cl, like MSVC) evaluates right to
+    ; left: z first, then y, then x. Doing the same here puts every light
+    ; where rin's are. (lights is zero to begin with, so w already is.)
+    movss xmm1, 9.0
+    movss xmm2, -4.5
+    call random_in
+    movss [rsi].point_light.position.z, xmm0
+    movss xmm1, 3.0
+    movss xmm2, -0.5
+    call random_in
+    movss [rsi].point_light.position.y, xmm0
+    movss xmm1, 9.0
+    movss xmm2, -4.5
+    call random_in
+    movss [rsi].point_light.position.x, xmm0
+    movss xmm1, 0.5
+    movss xmm2, 0.5
+    call random_in
+    movss [rsi].point_light.color.z, xmm0
+    movss xmm1, 0.5
+    movss xmm2, 0.5
+    call random_in
+    movss [rsi].point_light.color.y, xmm0
+    movss xmm1, 0.5
+    movss xmm2, 0.5
+    call random_in
+    movss [rsi].point_light.color.x, xmm0
+    add rsi, sizeof(point_light)
+    inc ebx
+    cmp ebx, LIGHT_COUNT
+    jb place_lights
+
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    call get_time
+    movss current_frame, xmm0
+    movss xmm1, xmm0
+    subss xmm0, last_frame
+    movss delta_time, xmm0
+    movss last_frame, xmm1
+
+    invoke(camera_process_input, cam&, delta_time&)
+    invoke(window_mode, 5)
+    mov lights.view_mode, eax
+
+    ; 1. geometry pass: render scene's geometry/colour data into the g-buffer
+    ; -----------------------------------------------------------------------
+    call unbind_textures
+    vcall(context, ID3D11DeviceContextVtbl.OMSetRenderTargets, 3, g_targets&, g_depth)
+    vcall(context, ID3D11DeviceContextVtbl.ClearRenderTargetView, positions.rtv, no_color&)
+    vcall(context, ID3D11DeviceContextVtbl.ClearRenderTargetView, normals.rtv, no_color&)
+    vcall(context, ID3D11DeviceContextVtbl.ClearRenderTargetView, albedo.rtv, no_color&)
+    movss xmm3, 1.0                        ; the depth, a float: xmm3
+    vcall(context, ID3D11DeviceContextVtbl.ClearDepthStencilView, g_depth, D3D11_CLEAR_FLAG.D3D11_CLEAR_DEPTH, 0, 0)
+    vcall(context, ID3D11DeviceContextVtbl.RSSetViewports, 1, viewport&)
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    invoke(bind_constants, 0, transforms_buffer)
+    invoke(transforms_from_camera, t&, cam&)
+    invoke(shader_use, geometry_shader&)
+    ; nine backpacks, three by three: translate(3x, 0, 3z) * scale(0.6)
+    mov esi, -1                            ; z
+  rows_z:
+    mov edi, -1                            ; x
+  rows_x:
+    cvtsi2ss xmm0, edi
+    mulss xmm0, 3.0
+    movss backpack_place.x, xmm0
+    mov backpack_place.y, 0
+    cvtsi2ss xmm0, esi
+    mulss xmm0, 3.0
+    movss backpack_place.z, xmm0
+    lea rcx, t.model
+    lea rdx, backpack_place
+    movss xmm2, 0.6
+    call m4_translate_scale
+    invoke(m4_normal_matrix, t.normal_matrix&, t.model&)
+    invoke(update_buffer, transforms_buffer, t&, sizeof(transforms))
+    invoke(model_draw, backpack&)
+    inc edi
+    cmp edi, 1
+    jle rows_x
+    inc esi
+    cmp esi, 1
+    jle rows_z
+
+    ; 2. lighting pass: light every visible pixel once, from the g-buffer
+    ; -------------------------------------------------------------------
+    call unbind_textures
+    invoke(window_begin, black&)
+    ; the lights drift in small circles: (0.6 cos(t + i), 0, 0.6 sin(t + i)) a second
+    lea rsi, lights.lights
+    xor ebx, ebx
+  drift:
+    cvtsi2ss xmm0, ebx
+    addss xmm0, current_frame
+    call cosf
+    mulss xmm0, 0.6
+    mulss xmm0, delta_time
+    addss xmm0, [rsi].point_light.position.x
+    movss [rsi].point_light.position.x, xmm0
+    cvtsi2ss xmm0, ebx
+    addss xmm0, current_frame
+    call sinf
+    mulss xmm0, 0.6
+    mulss xmm0, delta_time
+    addss xmm0, [rsi].point_light.position.z
+    movss [rsi].point_light.position.z, xmm0
+    add rsi, sizeof(point_light)
+    inc ebx
+    cmp ebx, LIGHT_COUNT
+    jb drift
+    invoke(update_buffer, lights_buffer, lights&, sizeof(lights_constants))
+    invoke(shader_use, lighting_shader&)
+    invoke(bind_constants, 1, lights_buffer)
+    vcall(context, ID3D11DeviceContextVtbl.PSSetShaderResources, 0, 3, g_views&)
+    vcall(context, ID3D11DeviceContextVtbl.Draw, 3, 0)
+
+    ; 3. render lights on top of the scene, depth tested against the g-buffer's depth
+    ; -------------------------------------------------------------------------------
+    cmp lights.view_mode, 0
+    jne no_lamps
+    vcall(context, ID3D11DeviceContextVtbl.OMSetRenderTargets, 1, backbuffer_rtv&, g_depth)
+    invoke(shader_use, lamp_shader&)
+    invoke(bind_constants, 1, lamp_buffer)
+    lea rsi, lights.lights
+    xor ebx, ebx
+  lamps:
+    movups xmm0, [rsi].point_light.color
+    movups lamp_color, xmm0
+    mov lamp_color.w, 0x3F800000           ; 1.0
+    invoke(update_buffer, lamp_buffer, lamp_color&, sizeof(vec4))
+    lea rcx, lamp_model
+    lea rdx, [rsi].point_light.position
+    movss xmm2, 0.12
+    call m4_translate_scale
+    invoke(draw_vertices, transforms_buffer, t&, cube_vb, 36, lamp_model&)
+    add rsi, sizeof(point_light)
+    inc ebx
+    cmp ebx, LIGHT_COUNT
+    jb lamps
+  no_lamps:
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

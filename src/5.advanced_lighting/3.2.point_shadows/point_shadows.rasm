@@ -1,0 +1,254 @@
+; 3.2 Point shadows
+;
+; A point light shines in every direction, so one shadow map is not enough: it
+; gets a cubemap of them, one face per axis. Each pixel looks up the face in
+; the direction from the light to itself.
+;
+; Two changes from 3.1:
+;
+;   * one pass fills all six faces. The depth cubemap is bound as a six-slice
+;     array, and a geometry shader copies every triangle six times, sending
+;     each copy to its slice with SV_RenderTargetArrayIndex, through that
+;     face's view
+;   * the map stores distance from the light, divided by the far plane,
+;     written by the pixel shader through SV_Depth, rather than the projected
+;     depth. Comparing distances is the same in every face
+;
+; The six face views are LearnOpenGL's, with one difference: a cubemap's faces
+; are laid out left-handed, which a right-handed look-at cannot produce. GL's
+; bottom-up framebuffer flips every rendered image and so fixes that for free;
+; D3D's is top-down, so the face projection flips y instead
+; (cube_face_matrices, includes/learn/shadow.rasm). That flip reverses the
+; winding, which is why culling stays off.
+;
+; The room is a large cube seen from inside, so its normals are flipped.
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/cube.rasm"
+import "../../../includes/learn/camera.rasm"
+import "../../../includes/learn/transforms.rasm"
+import "../../../includes/learn/shadow.rasm"
+import "../../../includes/learn/srgb.rasm"
+
+; Mirror `cbuffer shadow` and `cbuffer surface` in point_shadows.hlsl.
+shadow_constants: struct = {
+    faces: [6]mat4                         ; view-projection of each cube face
+    light_position: vec3
+    far_plane: f32
+}
+
+surface_constants: struct = {
+    flip_normals: f32                      ; -1 inside the room
+    pad: [3]f32
+}
+
+#define SHADOW_SIZE 1024
+
+camera_start: const vec3 = { 3.0, 0.0, 2.0 }
+tilt_axis: const vec3 = { 1.0, 0.0, 1.0 }
+cube_place_a: const vec3 = { 4.0, -3.5, 0.0 }
+cube_place_b: const vec3 = { 2.0, 3.0, 1.0 }
+cube_place_c: const vec3 = { -3.0, -1.0, 0.0 }
+cube_place_d: const vec3 = { -1.5, 1.0, 1.5 }
+cube_place_e: const vec3 = { -1.5, 2.0, -3.0 }
+room_size: const vec3 = { 10.0, 10.0, 10.0 }
+scale_e: const mat4 = { .m = {             ; scale(1.5), the last cube's
+    1.5, 0.0, 0.0, 0.0,
+    0.0, 1.5, 0.0, 0.0,
+    0.0, 0.0, 1.5, 0.0,
+    0.0, 0.0, 0.0, 1.0,
+} }
+clear_color: [4]const f32 = { 0.1, 0.1, 0.1, 1.0 }
+lamp_color: const vec4 = { 1.0, 1.0, 1.0, 1.0 }
+light_position: vec3 = {}                  ; x and y stay 0
+
+t: transforms = {}
+sh: shadow_constants = { .far_plane = 25.0 }
+surface: surface_constants = {}
+cubes: [5]mat4 = {}
+room: mat4 = {}
+model: mat4 = {}
+scratch: mat4 = {}
+s: shader = {}
+depth_shader: shader = {}
+lamp_shader: shader = {}
+cam: camera = {}
+depth_map: shadow_map = {}
+cube_vb: *ID3D11Buffer = {}
+transforms_buffer: *ID3D11Buffer = {}
+shadow_buffer: *ID3D11Buffer = {}
+surface_buffer: *ID3D11Buffer = {}
+lamp_buffer: *ID3D11Buffer = {}
+wood: *ID3D11ShaderResourceView = {}
+sampler: *ID3D11SamplerState = {}
+compare_sampler: *ID3D11SamplerState = {}
+
+; timing
+current_frame: f32 = 0.0
+delta_time: f32 = 0.0
+last_frame: f32 = 0.0
+
+; The five cubes inside the room, with whatever shader is bound.
+draw_cubes: proc() = {
+    push rbx
+    push rsi
+    sub rsp, 40                            ; draw_vertices takes 5: 32 + 8; entry 8 + two pushes 16 + 40 lands on 16
+    lea rsi, cubes
+    xor ebx, ebx
+  each_cube:
+    invoke(draw_vertices, transforms_buffer, t&, cube_vb, 36, rsi)
+    add rsi, sizeof(mat4)
+    inc ebx
+    cmp ebx, 5
+    jb each_cube
+    add rsp, 40
+    pop rsi
+    pop rbx
+    ret
+}
+
+main: proc() -> i32 = {
+    sub rsp, 40                            ; ClearDepthStencilView and draw_vertices take 5: 32 + 8; entry 8 + 40 lands on 16
+
+    invoke(window_create, "LearnD3D11")
+    ; The back buffer is viewed as sRGB: what the shaders write is linear, and
+    ; the view gamma-encodes it on the way in (5.2).
+    call window_use_srgb
+    call window_create_depth
+
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP)
+    mov sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 0, 1, sampler&)
+
+    ; build and compile shaders
+    ; -------------------------
+    invoke(shader_create, s&, "src/5.advanced_lighting/3.2.point_shadows/point_shadows.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+    invoke(shader_create, depth_shader&, "src/5.advanced_lighting/3.2.point_shadows/point_shadows_depth.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+    invoke(shader_create, lamp_shader&, "src/5.advanced_lighting/3.2.point_shadows/light_cube.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+
+    ; set up vertex data and textures
+    ; -------------------------------
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, cube_vertices&, sizeof(cube_vertices))
+    mov cube_vb, rax
+    invoke(create_constant_buffer, sizeof(transforms))
+    mov transforms_buffer, rax
+    invoke(create_constant_buffer, sizeof(shadow_constants))
+    mov shadow_buffer, rax
+    invoke(create_constant_buffer, sizeof(surface_constants))
+    mov surface_buffer, rax
+    invoke(create_constant_buffer, sizeof(vec4))
+    mov lamp_buffer, rax
+    invoke(filesystem_path, "resources/textures/wood.png")
+    invoke(load_texture, rax, 1)
+    mov wood, rax
+    invoke(create_depth_cube, depth_map&, SHADOW_SIZE)
+    call create_shadow_sampler
+    mov compare_sampler, rax
+
+    lea rcx, cam
+    lea rdx, camera_start
+    movss xmm2, -165.0                     ; yaw
+    xorps xmm3, xmm3                       ; pitch 0
+    call camera_create
+
+    ; five cubes around the room, and the room itself
+    invoke(m4_translate, cubes[0]&, cube_place_a&)
+    lea rcx, cubes[1]
+    lea rdx, cube_place_b
+    movss xmm2, 1.5
+    call m4_translate_scale
+    invoke(m4_translate, cubes[2]&, cube_place_c&)
+    invoke(m4_translate, cubes[3]&, cube_place_d&)
+    ; translate(-1.5, 2, -3) * rotate(60 degrees, (1, 0, 1)) * scale(1.5)
+    movss xmm0, 60.0
+    call radians
+    movaps xmm1, xmm0                      ; the angle, the second argument
+    lea rcx, model
+    lea r8, tilt_axis
+    call m4_rotate
+    invoke(m4_mul, scratch&, model&, scale_e&)
+    invoke(m4_translate, model&, cube_place_e&)
+    invoke(m4_mul, cubes[4]&, model&, scratch&)
+    invoke(m4_scale, room&, room_size&)
+
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    ; per-frame time logic
+    call get_time
+    movss current_frame, xmm0
+    movss xmm1, xmm0
+    subss xmm0, last_frame
+    movss delta_time, xmm0
+    movss last_frame, xmm1
+
+    invoke(camera_process_input, cam&, delta_time&)
+
+    ; move light position over time: (0, 0, 3 sin(t / 2))
+    movss xmm0, current_frame
+    mulss xmm0, math_half
+    call sinf
+    mulss xmm0, 3.0
+    movss light_position.z, xmm0
+    lea rcx, sh.faces
+    lea rdx, light_position
+    movss xmm2, 0.1                        ; z_near
+    movss xmm3, 25.0                       ; z_far
+    call cube_face_matrices
+    v3load_var(xmm0, light_position)
+    v3store_var(sh.light_position, xmm0)
+    invoke(update_buffer, shadow_buffer, sh&, sizeof(shadow_constants))
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    invoke(bind_constants, 0, transforms_buffer)
+    invoke(bind_constants, 1, shadow_buffer)
+
+    ; 1. render scene to depth cubemap: all six faces in one pass
+    ; -----------------------------------------------------------
+    call unbind_textures
+    vcall(context, ID3D11DeviceContextVtbl.OMSetRenderTargets, 0, 0, depth_map.dsv)
+    movss xmm3, 1.0                        ; the depth, a float: xmm3
+    vcall(context, ID3D11DeviceContextVtbl.ClearDepthStencilView, depth_map.dsv, D3D11_CLEAR_FLAG.D3D11_CLEAR_DEPTH, 0, 0)
+    invoke(set_viewport, SHADOW_SIZE, SHADOW_SIZE)
+    invoke(shader_use, depth_shader&)
+    invoke(draw_vertices, transforms_buffer, t&, cube_vb, 36, room&)
+    call draw_cubes
+
+    ; 2. render scene as normal
+    ; -------------------------
+    invoke(window_begin, clear_color&)
+    invoke(transforms_from_camera, t&, cam&)
+    invoke(shader_use, s&)
+    invoke(bind_constants, 2, surface_buffer)
+    invoke(bind_texture, 0, wood)
+    invoke(bind_texture, 1, depth_map.srv)
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 1, 1, compare_sampler&)
+    ; the room, seen from inside, then the cubes
+    mov surface.flip_normals, 0xBF800000   ; -1.0
+    invoke(update_buffer, surface_buffer, surface&, sizeof(surface_constants))
+    invoke(draw_vertices, transforms_buffer, t&, cube_vb, 36, room&)
+    mov surface.flip_normals, 0x3F800000   ; 1.0
+    invoke(update_buffer, surface_buffer, surface&, sizeof(surface_constants))
+    call draw_cubes
+
+    ; the lamp
+    invoke(update_buffer, lamp_buffer, lamp_color&, sizeof(vec4))
+    invoke(shader_use, lamp_shader&)
+    invoke(bind_constants, 1, lamp_buffer)
+    lea rcx, model
+    lea rdx, light_position
+    movss xmm2, 0.2
+    call m4_translate_scale
+    invoke(draw_vertices, transforms_buffer, t&, cube_vb, 36, model&)
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

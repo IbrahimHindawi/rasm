@@ -1,0 +1,150 @@
+; 4.1 Lighting maps
+;
+; One colour per material is too coarse for anything real: a crate is wood in
+; one place and steel in another. So the material moves into textures.
+;
+;   diffuse map    the surface colour, per texel (also used for ambient)
+;   specular map   how strongly each texel reflects highlights: the steel rim
+;                  is bright, the wood is black and never shines
+;
+; The lighting barely changes; it reads its material from the textures at the
+; pixel's texture coordinate instead of from constants.
+;
+;   W A S D, Space, Shift   move
+;   right mouse + drag      look
+;   wheel                   zoom
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/cube.rasm"
+import "../../../includes/learn/camera.rasm"
+import "../../../includes/learn/transforms.rasm"
+
+; Mirrors `cbuffer light` in lighting_maps.hlsl.
+light_constants: struct = {
+    position: vec3
+    shininess: f32
+    ambient: vec3
+    pad1: f32
+    diffuse: vec3
+    pad2: f32
+    specular: vec3
+    pad3: f32
+}
+
+camera_start: const vec3 = { -1.0, 1.0, 4.0 }
+y_axis: const vec3 = { 0.0, 1.0, 0.0 }
+clear_color: [4]const f32 = { 0.1, 0.1, 0.1, 1.0 }
+
+t: transforms = {}
+light: const light_constants = {
+    .position = { 1.2, 1.0, 2.0 },
+    .shininess = 64.0,
+    .ambient = { 0.2, 0.2, 0.2 },
+    .diffuse = { 0.5, 0.5, 0.5 },
+    .specular = { 1.0, 1.0, 1.0 },
+}
+lamp_color: const vec4 = { 1.0, 1.0, 1.0, 1.0 }
+model: mat4 = {}
+lighting_shader: shader = {}
+lamp_shader: shader = {}
+cam: camera = {}
+cube_vb: *ID3D11Buffer = {}
+transforms_buffer: *ID3D11Buffer = {}
+light_buffer: *ID3D11Buffer = {}
+lamp_buffer: *ID3D11Buffer = {}
+sampler: *ID3D11SamplerState = {}
+maps: [2]*ID3D11ShaderResourceView = {}
+stride: u32 = CUBE_STRIDE
+offset: u32 = 0
+
+; timing
+current_frame: f32 = 0.0
+delta_time: f32 = 0.0
+last_frame: f32 = 0.0
+
+main: proc() -> i32 = {
+    sub rsp, 56                            ; IASetVertexBuffers: 5 past `this`, 2 on the stack: 32 + 16; entry 8 + 56 lands on 16
+
+    invoke(window_create, "LearnD3D11")
+    call window_create_depth
+
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP)
+    mov sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 0, 1, sampler&)
+
+    invoke(shader_create, lighting_shader&, "src/2.lighting/4.1.lighting_maps/lighting_maps.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+    invoke(shader_create, lamp_shader&, "src/2.lighting/4.1.lighting_maps/light_cube.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, cube_vertices&, sizeof(cube_vertices))
+    mov cube_vb, rax
+    invoke(create_constant_buffer, sizeof(transforms))
+    mov transforms_buffer, rax
+    invoke(create_constant_buffer, sizeof(light_constants))
+    mov light_buffer, rax
+    invoke(create_constant_buffer, sizeof(vec4))
+    mov lamp_buffer, rax
+    ; the diffuse and specular maps, in t0 and t1
+    invoke(filesystem_path, "resources/textures/container2.png")
+    invoke(load_texture, rax, 0)
+    mov maps[0], rax
+    invoke(filesystem_path, "resources/textures/container2_specular.png")
+    invoke(load_texture, rax, 0)
+    mov maps[1], rax
+
+    lea rcx, cam
+    lea rdx, camera_start
+    movss xmm2, -75.0                      ; yaw
+    movss xmm3, -10.0                      ; pitch
+    call camera_create
+
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    call get_time
+    movss current_frame, xmm0
+    movss xmm1, xmm0
+    subss xmm0, last_frame
+    movss delta_time, xmm0
+    movss last_frame, xmm1
+
+    invoke(camera_process_input, cam&, delta_time&)
+
+    invoke(window_begin, clear_color&)
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    vcall(context, ID3D11DeviceContextVtbl.IASetVertexBuffers, 0, 1, cube_vb&, stride&, offset&)
+    invoke(bind_constants, 0, transforms_buffer)
+    invoke(transforms_from_camera, t&, cam&)
+
+    invoke(update_buffer, light_buffer, light&, sizeof(light_constants))
+    invoke(shader_use, lighting_shader&)
+    invoke(bind_constants, 1, light_buffer)
+    vcall(context, ID3D11DeviceContextVtbl.PSSetShaderResources, 0, 2, maps&)
+    ; the crate turns slowly, so the steel rim catches the light
+    movss xmm1, current_frame
+    mulss xmm1, 0.3                        ; the angle, the second argument
+    lea rcx, model
+    lea r8, y_axis
+    call m4_rotate
+    invoke(draw_cube, transforms_buffer, t&, model&)
+
+    invoke(update_buffer, lamp_buffer, lamp_color&, sizeof(vec4))
+    invoke(shader_use, lamp_shader&)
+    invoke(bind_constants, 1, lamp_buffer)
+    lea rcx, model
+    lea rdx, light.position
+    movss xmm2, 0.2                        ; the scale, the third argument
+    call m4_translate_scale
+    invoke(draw_cube, transforms_buffer, t&, model&)
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

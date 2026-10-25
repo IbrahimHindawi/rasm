@@ -1,0 +1,386 @@
+; 7. Bloom
+;
+; Very bright light seems to spill over its edges, in eyes and cameras alike.
+; Faking it takes three steps, all on HDR values:
+;
+;   1. draw the scene into two targets at once (multiple render targets): the
+;      colour, and only the parts brighter than 1
+;   2. blur the bright parts: a Gaussian, done as a horizontal pass then a
+;      vertical one, back and forth between two targets (ping-pong), five
+;      times each way. Two 1D blurs equal one 2D blur, at a fraction of the
+;      samples. The blur targets are half the window's size: the glow spreads
+;      twice as far for a quarter of the work
+;   3. add the blur back onto the colour, then tone map as in 6
+;
+; The light cubes are drawn far brighter than 1, so they glow; the lit crates
+; mostly stay under the threshold and do not.
+;
+;   Tab   bloom on / off
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/cube.rasm"
+import "../../../includes/learn/camera.rasm"
+import "../../../includes/learn/transforms.rasm"
+import "../../../includes/learn/srgb.rasm"
+
+plane_vertices: [48]const f32 = {          ; 6 vertices of 8 floats: position, normal, uv
+    -12.5, -1.0,  12.5,   0.0, 1.0, 0.0,    0.0, 12.0,
+     12.5, -1.0,  12.5,   0.0, 1.0, 0.0,   12.0, 12.0,
+     12.5, -1.0, -12.5,   0.0, 1.0, 0.0,   12.0,  0.0,
+    -12.5, -1.0,  12.5,   0.0, 1.0, 0.0,    0.0, 12.0,
+     12.5, -1.0, -12.5,   0.0, 1.0, 0.0,   12.0,  0.0,
+    -12.5, -1.0, -12.5,   0.0, 1.0, 0.0,    0.0,  0.0,
+}
+
+; Mirror the cbuffers of bloom.hlsl, blur.hlsl and bloom_final.hlsl.
+lights_constants: struct = {
+    positions: [4]vec4
+    colors: [4]vec4
+}
+
+emit_constants: struct = {
+    color: vec4                            ; w = 1: draw this colour unlit (a light cube)
+}
+
+blur_constants: struct = {
+    direction: vec2                        ; one texel, along x or along y
+    pad: vec2
+}
+
+combine_constants: struct = {
+    exposure: f32
+    bloom: u32
+    pad: [2]u32
+}
+
+; where each crate is: position, then turned this many degrees about (1, 0,
+; 1), then this size
+crate_placement: struct = {
+    position: vec3
+    degrees: f32
+    size: f32
+}
+
+camera_start: const vec3 = { 0.0, 1.5, 6.0 }
+tilt_axis: const vec3 = { 1.0, 0.0, 1.0 }
+crate_places: [6]const crate_placement = {
+    { .position = { 0.0, 1.5, 0.0 }, .degrees = 0.0, .size = 1.0 },
+    { .position = { 2.0, 0.0, 1.0 }, .degrees = 0.0, .size = 1.0 },
+    { .position = { -1.0, -1.0, 2.0 }, .degrees = 60.0, .size = 1.0 },
+    { .position = { 0.0, 2.7, 4.0 }, .degrees = 23.0, .size = 1.25 },
+    { .position = { -2.0, 1.0, -3.0 }, .degrees = 124.0, .size = 1.0 },
+    { .position = { -3.0, 0.0, 0.0 }, .degrees = 0.0, .size = 1.0 },
+}
+no_color: [4]const f32 = { 0.0, 0.0, 0.0, 0.0 }
+; The blur targets' size. masm64-dx11 halved scr_width and scr_height at run
+; time; C folds it here.
+half_w: const u32 = SCR_WIDTH / 2
+half_h: const u32 = SCR_HEIGHT / 2
+
+t: transforms = {}
+; lighting info: four lights, far brighter than 1. The constant buffer's
+; initialiser; draw_lights reads the light cubes' places and colours from it
+; too.
+lights: lights_constants = {
+    .positions = {
+        { 0.0, 0.5, 1.5, 0.0 },
+        { -4.0, 0.5, -3.0, 0.0 },
+        { 3.0, 0.5, 1.0, 0.0 },
+        { -0.8, 2.4, -1.0, 0.0 },
+    },
+    .colors = {
+        { 5.0, 5.0, 5.0, 0.0 },
+        { 10.0, 0.0, 0.0, 0.0 },
+        { 0.0, 0.0, 15.0, 0.0 },
+        { 0.0, 5.0, 0.0, 0.0 },
+    },
+}
+emit: emit_constants = {}
+blur: blur_constants = {}
+combine: combine_constants = { .exposure = 1.0, .bloom = 1 }
+crates: [6]mat4 = {}
+model: mat4 = {}
+scratch: mat4 = {}
+s: shader = {}
+blur_shader: shader = {}
+final_shader: shader = {}
+cam: camera = {}
+color_target: render_target = {}
+bright_target: render_target = {}
+pingpong: [2]render_target = {}
+scene_targets: [2]*ID3D11RenderTargetView = {}  ; color_target's and bright_target's, bound together
+scene_depth: *ID3D11DepthStencilView = {}
+blur_source: *ID3D11ShaderResourceView = {}
+cube_vb: *ID3D11Buffer = {}
+plane_vb: *ID3D11Buffer = {}
+transforms_buffer: *ID3D11Buffer = {}
+lights_buffer: *ID3D11Buffer = {}
+emit_buffer: *ID3D11Buffer = {}
+blur_buffer: *ID3D11Buffer = {}
+combine_buffer: *ID3D11Buffer = {}
+wood: *ID3D11ShaderResourceView = {}
+crate: *ID3D11ShaderResourceView = {}
+sampler: *ID3D11SamplerState = {}
+clamp_sampler: *ID3D11SamplerState = {}
+
+; timing
+delta_time: f32 = 0.0
+last_frame: f32 = 0.0
+
+crate_model_rotation: mat4 = {}            ; crate_model's (MASM's `local`)
+
+; rcx: out mat4, rdx: crate_placement -> translate(position) * rotate(degrees, (1, 0, 1)) * scale
+crate_model: proc(out: *mat4, place: *const crate_placement) = {
+    push rbx
+    push rsi
+    sub rsp, 40                            ; 32 shadow; entry 8 + two pushes 16 + 40 lands on 16
+    mov rbx, rcx                           ; out
+    mov rsi, rdx                           ; place
+    movss xmm0, [rsi].crate_placement.degrees
+    call radians
+    movaps xmm1, xmm0                      ; the angle, the second argument
+    lea rcx, crate_model_rotation
+    lea r8, tilt_axis
+    call m4_rotate
+    invoke(m4_identity, scratch&)
+    mov eax, [rsi].crate_placement.size
+    mov scratch.m[0], eax                  ; the diagonal: a uniform scale
+    mov scratch.m[5], eax
+    mov scratch.m[10], eax
+    invoke(m4_mul, scratch&, crate_model_rotation&, scratch&)
+    lea rdx, [rsi].crate_placement.position
+    invoke(m4_translate, rbx, rdx)
+    invoke(m4_mul, rbx, rbx, scratch&)
+    add rsp, 40
+    pop rsi
+    pop rbx
+    ret
+}
+
+main: proc() -> i32 = {
+    push rbx
+    push rsi
+    push rdi
+    sub rsp, 48                            ; 5-argument calls (draw_vertices, create_render_target): 32 + 8; entry 8 + 24 + 48 lands on 16
+
+    invoke(window_create, "LearnD3D11  (Tab: bloom on / off)")
+    ; The back buffer is viewed as sRGB: what the shaders write is linear, and
+    ; the view gamma-encodes it on the way in (5.2).
+    call window_use_srgb
+
+    ; s0 for textures; s1, linear and clamped, for the blur, which must not
+    ; wrap round the edges
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP)
+    mov sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 0, 1, sampler&)
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_CLAMP)
+    mov clamp_sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 1, 1, clamp_sampler&)
+
+    ; build and compile shaders
+    ; -------------------------
+    invoke(shader_create, s&, "src/5.advanced_lighting/7.bloom/bloom.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+    invoke(shader_create, blur_shader&, "src/5.advanced_lighting/7.bloom/blur.hlsl", 0, 0)
+    invoke(shader_create, final_shader&, "src/5.advanced_lighting/7.bloom/bloom_final.hlsl", 0, 0)
+
+    ; set up vertex data and textures
+    ; -------------------------------
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, cube_vertices&, sizeof(cube_vertices))
+    mov cube_vb, rax
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, plane_vertices&, sizeof(plane_vertices))
+    mov plane_vb, rax
+    invoke(create_constant_buffer, sizeof(transforms))
+    mov transforms_buffer, rax
+    invoke(create_constant_buffer, sizeof(lights_constants))
+    mov lights_buffer, rax
+    invoke(create_constant_buffer, sizeof(emit_constants))
+    mov emit_buffer, rax
+    invoke(create_constant_buffer, sizeof(blur_constants))
+    mov blur_buffer, rax
+    invoke(create_constant_buffer, sizeof(combine_constants))
+    mov combine_buffer, rax
+    invoke(filesystem_path, "resources/textures/wood.png")
+    invoke(load_texture, rax, 1)
+    mov wood, rax
+    invoke(filesystem_path, "resources/textures/container2.png")
+    invoke(load_texture, rax, 1)
+    mov crate, rax
+
+    lea rcx, cam
+    lea rdx, camera_start
+    movss xmm2, -90.0                      ; yaw
+    movss xmm3, -15.0                      ; pitch
+    call camera_create
+
+    ; configure floating point framebuffers: two colour targets for the scene,
+    ; and two half-size ones to ping-pong the blur between
+    ; ------------------------------------------------------------------------
+    invoke(create_render_target, color_target&, SCR_WIDTH, SCR_HEIGHT, DXGI_FORMAT.DXGI_FORMAT_R16G16B16A16_FLOAT, 1)
+    invoke(create_render_target, bright_target&, SCR_WIDTH, SCR_HEIGHT, DXGI_FORMAT.DXGI_FORMAT_R16G16B16A16_FLOAT, 1)
+    invoke(create_depth_buffer, SCR_WIDTH, SCR_HEIGHT, 1)
+    mov scene_depth, rax
+    ; half_w and half_h are u32 globals: into their argument registers first,
+    ; then passed as themselves
+    mov edx, half_w
+    mov r8d, half_h
+    invoke(create_render_target, pingpong[0]&, rdx, r8, DXGI_FORMAT.DXGI_FORMAT_R16G16B16A16_FLOAT, 1)
+    mov edx, half_w
+    mov r8d, half_h
+    invoke(create_render_target, pingpong[1]&, rdx, r8, DXGI_FORMAT.DXGI_FORMAT_R16G16B16A16_FLOAT, 1)
+    mov rax, color_target.rtv
+    mov scene_targets[0], rax
+    mov rax, bright_target.rtv
+    mov scene_targets[1], rax
+
+    ; lighting info
+    ; -------------
+    invoke(update_buffer, lights_buffer, lights&, sizeof(lights_constants))
+
+    lea rsi, crate_places
+    lea rdi, crates
+    xor ebx, ebx
+  place_crates:
+    invoke(crate_model, rdi, rsi)
+    add rsi, sizeof(crate_placement)
+    add rdi, sizeof(mat4)
+    inc ebx
+    cmp ebx, 6
+    jb place_crates
+
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    call get_time
+    movss xmm1, xmm0
+    subss xmm0, last_frame
+    movss delta_time, xmm0
+    movss last_frame, xmm1
+
+    invoke(camera_process_input, cam&, delta_time&)
+    ; mode 0 with bloom, mode 1 without
+    invoke(window_mode, 2)
+    mov ecx, 1
+    sub ecx, eax
+    mov combine.bloom, ecx
+
+    ; 1. render scene into floating point framebuffer: colour and bright parts at once
+    ; --------------------------------------------------------------------------------
+    call unbind_textures
+    vcall(context, ID3D11DeviceContextVtbl.OMSetRenderTargets, 2, scene_targets&, scene_depth)
+    vcall(context, ID3D11DeviceContextVtbl.ClearRenderTargetView, color_target.rtv, no_color&)
+    vcall(context, ID3D11DeviceContextVtbl.ClearRenderTargetView, bright_target.rtv, no_color&)
+    movss xmm3, 1.0                        ; the depth, a float: xmm3
+    vcall(context, ID3D11DeviceContextVtbl.ClearDepthStencilView, scene_depth, D3D11_CLEAR_FLAG.D3D11_CLEAR_DEPTH, 0, 0)
+    vcall(context, ID3D11DeviceContextVtbl.RSSetViewports, 1, viewport&)
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    invoke(bind_constants, 0, transforms_buffer)
+    invoke(transforms_from_camera, t&, cam&)
+    invoke(shader_use, s&)
+    invoke(bind_constants, 1, lights_buffer)
+    invoke(bind_constants, 2, emit_buffer)
+    ; emit.color = 0: lit as usual (MASM's mem_zero, for one vec4)
+    xorps xmm0, xmm0
+    movups emit.color, xmm0
+    invoke(update_buffer, emit_buffer, emit&, sizeof(emit_constants))
+    invoke(bind_texture, 0, wood)
+    invoke(m4_identity, model&)
+    invoke(draw_vertices, transforms_buffer, t&, plane_vb, 6, model&)
+    invoke(bind_texture, 0, crate)
+    lea rsi, crates
+    xor ebx, ebx
+  draw_crates:
+    invoke(draw_vertices, transforms_buffer, t&, cube_vb, 36, rsi)
+    add rsi, sizeof(mat4)
+    inc ebx
+    cmp ebx, 6
+    jb draw_crates
+    ; the lights themselves: no lighting, just their own HDR colour
+    xor ebx, ebx
+  draw_lights:
+    mov eax, ebx
+    shl eax, 4                             ; * sizeof(vec4)
+    lea rsi, lights.colors
+    movups xmm0, [rsi + rax]
+    movups emit.color, xmm0
+    mov emit.color.w, 0x3F800000           ; 1.0: unlit
+    invoke(update_buffer, emit_buffer, emit&, sizeof(emit_constants))
+    mov eax, ebx
+    shl eax, 4
+    lea rdx, lights.positions              ; a vec4, read as its vec3
+    add rdx, rax
+    lea rcx, model
+    movss xmm2, 0.25
+    call m4_translate_scale
+    invoke(draw_vertices, transforms_buffer, t&, cube_vb, 36, model&)
+    inc ebx
+    cmp ebx, 4
+    jb draw_lights
+
+    ; 2. blur bright fragments with two-pass Gaussian blur
+    ; ----------------------------------------------------
+    invoke(shader_use, blur_shader&)
+    invoke(bind_constants, 1, blur_buffer)
+    mov ecx, half_w
+    mov edx, half_h
+    call set_viewport
+    mov rax, bright_target.srv
+    mov blur_source, rax
+    xor ebx, ebx
+  blur_passes:
+    ; even passes blur along x, odd ones along y, one texel at a time
+    mov blur.direction.x, 0
+    mov blur.direction.y, 0
+    movss xmm0, 1.0
+    test ebx, 1
+    jnz along_y
+    cvtsi2ss xmm1, half_w
+    divss xmm0, xmm1
+    movss blur.direction.x, xmm0
+    jmp along_done
+  along_y:
+    cvtsi2ss xmm1, half_h
+    divss xmm0, xmm1
+    movss blur.direction.y, xmm0
+  along_done:
+    invoke(update_buffer, blur_buffer, blur&, sizeof(blur_constants))
+    call unbind_textures
+    ; the target: pingpong[i % 2]
+    mov eax, ebx
+    and eax, 1
+    imul eax, eax, sizeof(render_target)
+    lea rsi, pingpong
+    add rsi, rax
+    lea rax, [rsi].render_target.rtv
+    vcall(context, ID3D11DeviceContextVtbl.OMSetRenderTargets, 1, rax, 0)
+    invoke(bind_texture, 0, blur_source)
+    vcall(context, ID3D11DeviceContextVtbl.Draw, 3, 0)
+    mov rax, [rsi].render_target.srv
+    mov blur_source, rax
+    inc ebx
+    cmp ebx, 10
+    jb blur_passes
+
+    ; 3. now render floating point colour buffer to the screen, adding the blur and tone mapping
+    ; ------------------------------------------------------------------------------------------
+    call unbind_textures
+    vcall(context, ID3D11DeviceContextVtbl.OMSetRenderTargets, 1, backbuffer_rtv&, 0)
+    vcall(context, ID3D11DeviceContextVtbl.RSSetViewports, 1, viewport&)
+    invoke(update_buffer, combine_buffer, combine&, sizeof(combine_constants))
+    invoke(shader_use, final_shader&)
+    invoke(bind_constants, 1, combine_buffer)
+    invoke(bind_texture, 0, color_target.srv)
+    invoke(bind_texture, 1, blur_source)
+    vcall(context, ID3D11DeviceContextVtbl.Draw, 3, 0)
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

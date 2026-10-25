@@ -1,0 +1,147 @@
+; 7.1 Camera
+;
+; The same ten cubes, seen through a camera you can fly. A camera is only a
+; view matrix: a position, a direction to look in and which way is up, turned
+; by look_at into the matrix that moves the world in front of it.
+;
+; The direction comes from two angles, yaw and pitch, which the mouse changes.
+; Movement is scaled by the frame's duration, so the speed is the same at any
+; frame rate. The camera is includes/learn/camera.rasm, LearnOpenGL's Camera
+; class; every lesson from here on uses it.
+;
+;   W A S D, Space, Shift   move
+;   right mouse + drag      look
+;   wheel                   zoom
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/cube.rasm"
+import "../../../includes/learn/camera.rasm"
+
+camera_start: const vec3 = { -1.5, 1.0, 4.0 }
+clear_color: [4]const f32 = { 0.2, 0.3, 0.3, 1.0 }
+
+object_constants: struct = {
+    model: mat4
+    view: mat4
+    projection: mat4
+}
+
+c: object_constants = {}
+s: shader = {}
+cam: camera = {}
+cube_vb: *ID3D11Buffer = {}
+sampler: *ID3D11SamplerState = {}
+constants: *ID3D11Buffer = {}
+textures: [2]*ID3D11ShaderResourceView = {}
+stride: u32 = CUBE_STRIDE
+offset: u32 = 0
+
+; timing
+delta_time: f32 = 0.0
+last_frame: f32 = 0.0
+
+main: proc() -> i32 = {
+    push rbx
+    sub rsp, 48                            ; IASetVertexBuffers takes 6: 32 + 16; entry 8 + push 8 + 48 lands on 16
+
+    invoke(window_create, "LearnD3D11")
+    call window_create_depth
+
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP)
+    mov sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 0, 1, sampler&)
+
+    ; build and compile our shader program
+    ; ------------------------------------
+    invoke(shader_create, s&, "src/1.getting_started/7.1.camera/camera.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+
+    ; set up vertex data and textures
+    ; -------------------------------
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, cube_vertices&, sizeof(cube_vertices))
+    mov cube_vb, rax
+    invoke(filesystem_path, "resources/textures/container.jpg")
+    invoke(load_texture, rax, 0)
+    mov textures[0], rax
+    invoke(filesystem_path, "resources/textures/awesomeface.png")
+    invoke(load_texture, rax, 0)
+    mov textures[1], rax
+    invoke(create_constant_buffer, sizeof(object_constants))
+    mov constants, rax
+
+    ; camera
+    ; ------
+    ; yaw and pitch are floats, the third and fourth arguments: xmm2 and xmm3.
+    lea rcx, cam
+    lea rdx, camera_start
+    movss xmm2, -70.0                      ; yaw
+    movss xmm3, -10.0                      ; pitch
+    call camera_create
+
+    ; render loop
+    ; -----------
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    ; per-frame time logic
+    ; --------------------
+    call get_time
+    movss xmm1, xmm0
+    subss xmm0, last_frame
+    movss delta_time, xmm0
+    movss last_frame, xmm1
+
+    ; input
+    ; -----
+    invoke(camera_process_input, cam&, delta_time&)
+
+    ; render
+    ; ------
+    vcall(context, ID3D11DeviceContextVtbl.OMSetRenderTargets, 1, backbuffer_rtv&, depth_dsv)
+    vcall(context, ID3D11DeviceContextVtbl.RSSetViewports, 1, viewport&)
+    vcall(context, ID3D11DeviceContextVtbl.ClearRenderTargetView, backbuffer_rtv, clear_color&)
+    movss xmm3, 1.0                        ; the depth, a float: xmm3
+    vcall(context, ID3D11DeviceContextVtbl.ClearDepthStencilView, depth_dsv,
+          D3D11_CLEAR_FLAG.D3D11_CLEAR_DEPTH | D3D11_CLEAR_FLAG.D3D11_CLEAR_STENCIL, 0, 0)
+
+    vcall(context, ID3D11DeviceContextVtbl.PSSetShaderResources, 0, 2, textures&)
+    invoke(shader_use, s&)
+    invoke(bind_constants, 0, constants)
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    vcall(context, ID3D11DeviceContextVtbl.IASetVertexBuffers, 0, 1, cube_vb&, stride&, offset&)
+
+    ; view from the camera; projection with the camera's zoom as its field of view
+    invoke(camera_view, c.view&, cam&)
+    movss xmm0, 100.0
+    movss dword ptr [rsp + 32], xmm0       ; z_far
+    movss xmm0, cam.zoom
+    call radians
+    movaps xmm1, xmm0                      ; fovy
+    cvtsi2ss xmm2, scr_width
+    cvtsi2ss xmm0, scr_height
+    divss xmm2, xmm0                       ; aspect
+    movss xmm3, 0.1                        ; z_near
+    lea rcx, c.projection
+    call m4_perspective
+
+    xor ebx, ebx
+  cubes:
+    ; model = translate(cube_positions[i]) * rotate(radians(20 * i), (1, 0.3, 0.5))
+    invoke(cube_model, c.model&, rbx)
+    invoke(update_buffer, constants, c&, sizeof(object_constants))
+    vcall(context, ID3D11DeviceContextVtbl.Draw, 36, 0)
+    inc ebx
+    cmp ebx, 10
+    jb cubes
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

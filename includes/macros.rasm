@@ -1,0 +1,42 @@
+; macros: the small vocabulary every lesson shares besides invoke and vcall
+;
+; Checks that stop in the debugger, and releasing a COM object. Each is a few
+; instructions, every one of them written here. The labels inside a macro are
+; renamed for each use, so a proc may use the same check twice.
+;
+;     vcall(device, ID3D11DeviceVtbl.CreateBuffer, desc&, init&, buffer&)
+;     assert_hr()                    ; int 3 if that HRESULT failed
+;     assert_not_eq(rax, 0)          ; int 3 if rax is 0
+;     release(blob)                  ; blob->Release()
+
+import "calls.rasm"
+
+; An HRESULT is a failure when its top bit is set: eax is negative.
+assert_hr: macro() = {
+    test eax, eax
+    jns ok
+    int 3
+  ok:
+}
+
+; Stop when a == b.
+assert_not_eq: macro(a, b) = {
+    cmp a, b
+    jne ok
+    int 3
+  ok:
+}
+
+; Stop when a != b.
+assert_eq: macro(a, b) = {
+    cmp a, b
+    je ok
+    int 3
+  ok:
+}
+
+; Every COM interface starts with IUnknown's three methods, so Release is at
+; the same offset in every vtable: IUnknownVtbl.Release, 16.
+release: macro(object) = {
+    vcall(object, IUnknownVtbl.Release)
+}

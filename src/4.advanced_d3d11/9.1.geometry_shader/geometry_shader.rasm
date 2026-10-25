@@ -1,0 +1,129 @@
+; 9.1 Geometry shader
+;
+; A stage between the vertex and pixel shaders that sees whole primitives, and
+; may emit different ones: more, fewer, or of another kind.
+;
+;   exploding  each triangle is pushed out along its own face normal, by an
+;              amount that pulses over time. The geometry shader can do this
+;              because it has all three corners; a vertex shader sees one
+;   normals    a second pass over the same model, whose geometry shader turns
+;              each triangle into three short lines, one along each corner's
+;              normal: a quick way to check that a model's normals are right
+;
+; shader_create compiles gs_main when a file has one, and shader_use binds it,
+; or unbinds it when there is none.
+;
+;   Tab   whole / exploding / whole with normals
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/camera.rasm"
+import "../../../includes/learn/transforms.rasm"
+import "../../../includes/learn/model.rasm"
+
+; Mirrors `cbuffer explode` in explode.hlsl. A constant buffer is whole
+; 16-byte registers, so the one float is padded to a register.
+explode_constants: struct = {
+    amount: f32                                ; 0 whole, 1 pushed out
+    pad: [3]f32
+}
+
+camera_start: const vec3 = { 0.0, 0.5, 4.5 }
+clear_color: [4]const f32 = { 0.05, 0.05, 0.05, 1.0 }
+
+t: transforms = {}
+explosion: explode_constants = {}
+explode: shader = {}
+normals: shader = {}
+cam: camera = {}
+backpack: model = {}
+transforms_buffer: *ID3D11Buffer = {}
+amount_buffer: *ID3D11Buffer = {}
+sampler: *ID3D11SamplerState = {}
+mode: u32 = 0
+
+; timing
+current_frame: f32 = 0.0
+delta_time: f32 = 0.0
+last_frame: f32 = 0.0
+
+main: proc() -> i32 = {
+    sub rsp, 40                                ; no call takes more than 4: 32 shadow, plus 8 to land on 16
+
+    invoke(window_create, "LearnD3D11")
+    call window_create_depth
+    invoke(window_mode_default, 2)
+
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP)
+    mov sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 0, 1, sampler&)
+
+    invoke(shader_create, explode&, "src/4.advanced_d3d11/9.1.geometry_shader/explode.hlsl", model_layout&, MODEL_LAYOUT_COUNT)
+    invoke(shader_create, normals&, "src/4.advanced_d3d11/9.1.geometry_shader/normal_visualization.hlsl", model_layout&, MODEL_LAYOUT_COUNT)
+    invoke(model_load, backpack&, "resources/objects/backpack/", "backpack.obj", 0)
+    invoke(create_constant_buffer, sizeof(transforms))
+    mov transforms_buffer, rax
+    invoke(create_constant_buffer, sizeof(explode_constants))
+    mov amount_buffer, rax
+
+    lea rcx, cam
+    lea rdx, camera_start
+    movss xmm2, -90.0                          ; yaw
+    movss xmm3, -5.0                           ; pitch
+    call camera_create
+
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    call get_time
+    movss current_frame, xmm0
+    movss xmm1, xmm0
+    subss xmm0, last_frame
+    movss delta_time, xmm0
+    movss last_frame, xmm1
+
+    invoke(camera_process_input, cam&, delta_time&)
+    invoke(window_mode, 3)
+    mov mode, eax
+
+    invoke(window_begin, clear_color&)
+    invoke(transforms_from_camera, t&, cam&)
+    invoke(m4_identity, t.model&)
+    invoke(m4_identity, t.normal_matrix&)
+    invoke(update_buffer, transforms_buffer, t&, sizeof(transforms))
+    invoke(bind_constants, 0, transforms_buffer)
+
+    ; exploding: amount = (sin(2 t) + 1) / 2; otherwise whole
+    mov explosion.amount, 0                    ; 0.0 has the bits of 0
+    cmp mode, 1
+    jne whole
+    movss xmm0, current_frame
+    addss xmm0, xmm0
+    call sinf
+    addss xmm0, math_one
+    mulss xmm0, math_half
+    movss explosion.amount, xmm0
+  whole:
+    invoke(update_buffer, amount_buffer, explosion&, sizeof(explode_constants))
+    invoke(shader_use, explode&)
+    invoke(bind_constants, 1, amount_buffer)
+    invoke(model_draw, backpack&)
+
+    ; and again, as lines along the normals
+    cmp mode, 2
+    jne no_normals
+    invoke(shader_use, normals&)
+    invoke(model_draw, backpack&)
+  no_normals:
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

@@ -1,0 +1,183 @@
+; 1.1 Hello window
+;
+; A window, a D3D11 device, and a colour every frame: what GLFW and a GL
+; context give LearnOpenGL, done by hand because on Windows it is only a page.
+;
+;   1. register a window class, naming the procedure that receives the
+;      window's events, and create the window
+;   2. create the device (which makes resources), its immediate context
+;      (which records drawing) and a swap chain (the images that take turns
+;      being shown and drawn into)
+;   3. a render target view of the swap chain's back buffer, so it can be
+;      cleared and drawn into
+;   4. loop: hand window events to window_proc, clear, present
+;
+; Everything is in this one file, which is the whole program: `rin asm`
+; assembles it with what it imports. From here on the conventions are (see
+; docs/0_rasm.md):
+;
+;   * Win64 calling: arguments in rcx, rdx, r8, r9, then the stack; results in
+;     rax (or xmm0). rbx, rsi, rdi, rbp, r12-r15 and xmm6-xmm15 survive calls,
+;     everything else may not.
+;   * every proc writes its own frame: `sub rsp, N` reserves the 32 bytes of
+;     shadow space (and room for stack arguments) and puts rsp back on 16.
+;   * `invoke(f, args)` makes such a call, `vcall(object, Vtbl.Method, args)`
+;     calls a COM method (includes/calls.rasm). D3D11 is all COM.
+;   * there are no locals: what a proc keeps is a global, with its real type,
+;     so the debugger shows it by name and field.
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/print.rasm"
+
+; settings
+#define SCR_WIDTH 1280
+#define SCR_HEIGHT 720
+#define WINDOW_STYLE (WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX))
+; windows.h spells this MAKEINTRESOURCE(32512), a call-shaped macro rasm
+; cannot evaluate, so the number is written here; C keeps the header's.
+#define IDC_ARROW 32512
+
+clear_color: [4]const f32 = { 0.2, 0.3, 0.3, 1.0 }
+
+; win32 state. What is known now is written now; the rest is stored by main.
+wc: WNDCLASSEXA = {
+    .cbSize = sizeof(WNDCLASSEXA),
+    .lpfnWndProc = window_proc&,
+    .lpszClassName = "LearnD3D11",
+}
+; A fixed size: the swap chain and every render target keep the size they
+; were created with, so nothing needs rebuilding on resize. The size asked for
+; is the inside of the window, and AdjustWindowRect adds the borders.
+rect: RECT = { .right = SCR_WIDTH, .bottom = SCR_HEIGHT }
+window: HWND = {}
+msg: MSG = {}
+running: b32 = 1
+
+; d3d11 state
+swap_desc: DXGI_SWAP_CHAIN_DESC = {
+    .BufferDesc = {
+        .Width = SCR_WIDTH,
+        .Height = SCR_HEIGHT,
+        .Format = DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM,
+    },
+    .SampleDesc = { .Count = 1 },
+    .BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    .BufferCount = 2,
+    .Windowed = 1,
+    .SwapEffect = DXGI_SWAP_EFFECT.DXGI_SWAP_EFFECT_FLIP_DISCARD,
+}
+feature_level: D3D_FEATURE_LEVEL = D3D_FEATURE_LEVEL.D3D_FEATURE_LEVEL_11_0
+swap_chain: *IDXGISwapChain = {}
+device: *ID3D11Device = {}
+context: *ID3D11DeviceContext = {}
+backbuffer: *ID3D11Texture2D = {}
+backbuffer_rtv: *ID3D11RenderTargetView = {}
+
+; win32: every event for the window (keys, mouse, closing) arrives here
+; ---------------------------------------------------------------------
+; The parameters stay in their registers: rcx hwnd, edx msg, r8 wparam, r9
+; lparam. Anything not handled goes to DefWindowProcA with all four still in
+; place, so that call is a jump.
+window_proc: proc(hwnd: HWND, umsg: UINT, wparam: WPARAM, lparam: LPARAM) -> LRESULT = {
+    cmp edx, WM_DESTROY
+    jne pass_on
+    sub rsp, 40                            ; shadow space, and rsp back on 16: it was 8 off at entry
+    invoke(PostQuitMessage, 0)
+    add rsp, 40
+    xor eax, eax
+    ret
+  pass_on:
+    jmp DefWindowProcA
+}
+
+; process all input: ask Windows whether relevant keys are down this frame and react accordingly
+; ----------------------------------------------------------------------------------------------
+; The top bit of GetAsyncKeyState is set while a key is held, which makes the
+; SHORT negative.
+process_input: proc() = {
+    sub rsp, 40                            ; 32 shadow, and rsp back on 16
+    invoke(GetAsyncKeyState, VK_ESCAPE)
+    test ax, ax
+    jns done
+    invoke(DestroyWindow, window)
+  done:
+    add rsp, 40
+    ret
+}
+
+main: proc() -> i32 = {
+    push rbx
+    push rsi
+    sub rsp, 104                           ; 12-argument calls: 32 shadow + 8 * 8, plus 8 to land on 16
+
+    ; win32: register a window class and create the window
+    ; ----------------------------------------------------
+    call SetProcessDPIAware
+    invoke(GetModuleHandleA, 0)
+    mov wc.hInstance, rax
+    invoke(LoadCursorA, 0, IDC_ARROW)
+    mov wc.hCursor, rax
+    invoke(RegisterClassExA, wc&)
+    invoke(AdjustWindowRect, rect&, WINDOW_STYLE, 0)
+    mov ebx, rect.right
+    sub ebx, rect.left
+    mov esi, rect.bottom
+    sub esi, rect.top
+    invoke(CreateWindowExA, 0, wc.lpszClassName, "LearnD3D11", WINDOW_STYLE | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, rbx, rsi, 0, 0,
+           wc.hInstance, 0)
+    test rax, rax
+    jnz window_created
+    invoke(print, "Failed to create the window\n")
+    invoke(ExitProcess, 1)
+  window_created:
+    mov window, rax
+    mov swap_desc.OutputWindow, rax
+
+    ; d3d11: create the device, its immediate context and a swap chain
+    ; ----------------------------------------------------------------
+    invoke(D3D11CreateDeviceAndSwapChain, 0, D3D_DRIVER_TYPE.D3D_DRIVER_TYPE_HARDWARE, 0, 0, feature_level&, 1, D3D11_SDK_VERSION,
+           swap_desc&, swap_chain&, device&, 0, context&)
+    test eax, eax
+    jns device_created
+    invoke(print, "Failed to create the D3D11 device\n")
+    invoke(ExitProcess, 1)
+  device_created:
+    vcall(swap_chain, IDXGISwapChainVtbl.GetBuffer, 0, IID_ID3D11Texture2D&, backbuffer&)
+    vcall(device, ID3D11DeviceVtbl.CreateRenderTargetView, backbuffer, 0, backbuffer_rtv&)
+
+    ; render loop
+    ; -----------
+  render_loop:
+  pump:
+    invoke(PeekMessageA, msg&, 0, 0, 0, PM_REMOVE)
+    test eax, eax
+    jz pumped
+    cmp msg.message, WM_QUIT
+    jne not_quit
+    mov running, 0
+  not_quit:
+    invoke(TranslateMessage, msg&)
+    invoke(DispatchMessageA, msg&)
+    jmp pump
+  pumped:
+    cmp running, 0
+    je render_loop_done
+
+    ; input
+    ; -----
+    call process_input
+
+    ; render
+    ; ------
+    vcall(context, ID3D11DeviceContextVtbl.ClearRenderTargetView, backbuffer_rtv, clear_color&)
+
+    ; dxgi: show the image just drawn, waiting for the next vertical blank
+    ; --------------------------------------------------------------------
+    vcall(swap_chain, IDXGISwapChainVtbl.Present, 1, 0)
+    jmp render_loop
+  render_loop_done:
+
+    ; ExitProcess does not return, so there is no epilogue: rbx and rsi are
+    ; never restored, and the 104 bytes are never given back.
+    invoke(ExitProcess, 0)
+}

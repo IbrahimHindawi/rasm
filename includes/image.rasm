@@ -1,0 +1,287 @@
+; image: loading images, what stb_image is to LearnOpenGL
+;
+;   image_load       .png / .jpg through WIC, Windows' own codecs, as RGBA8
+;   image_load_hdr   Radiance .hdr, as linear float RGBA
+;
+; Pixels come back top row first, which is how D3D lays out a texture, so
+; nothing is flipped. They live in the arena as long as the program.
+
+import "d3d11.rin"
+import "calls.rasm"
+import "macros.rasm"
+import "saha.rasm"
+import "cstr.rasm"
+
+image: struct = {
+    pixels: *u8                            ; RGBA8, width * height * 4 bytes (image_load_hdr: 4 floats a pixel)
+    width: u32
+    height: u32
+}
+
+image_wic: *IWICImagingFactory = {}
+
+; image_load's
+image_load_wide: [520]u16 = {}             ; the path, as UTF-16 for WIC
+image_load_decoder: *IWICBitmapDecoder = {}
+image_load_frame: *IWICBitmapFrameDecode = {}
+image_load_converter: *IWICFormatConverter = {}
+image_load_w: u32 = 0
+image_load_h: u32 = 0
+image_load_bytes: u64 = 0
+
+; image_load_hdr's
+image_hdr_file: HANDLE = {}
+image_hdr_size: LARGE_INTEGER = {}
+image_hdr_got: u32 = 0
+image_hdr_row: *u8 = {}                    ; one row of RGBE, decoded a channel at a time
+image_hdr_w: u64 = 0
+image_hdr_h: u64 = 0
+
+; The WIC factory, and the arena, on first use.
+image_init: proc() = {
+    sub rsp, 40                            ; CoCreateInstance takes 5: 32 + 8, and rsp lands on 16
+    cmp image_wic, 0
+    jne done
+    cmp arena.base, 0
+    jne have_arena
+    invoke(arenaInit, arena&)
+  have_arena:
+    invoke(CoInitializeEx, 0, COINIT.COINIT_MULTITHREADED)
+    invoke(CoCreateInstance, CLSID_WICImagingFactory2&, 0, CLSCTX.CLSCTX_INPROC_SERVER, IID_IWICImagingFactory&, image_wic&)
+    assert_hr()
+  done:
+    add rsp, 40
+    ret
+}
+
+; rcx: image, rdx: path -> rax: the pixels, 0 when the file cannot be read or decoded
+image_load: proc(out: *image, path: *const c8) -> *u8 = {
+    push rbx
+    push rsi
+    sub rsp, 56                            ; Initialize: 6 arguments past `this`, 3 on the stack: 32 + 24; entry 8 + 16 + 56 lands on 16
+    mov rbx, rcx                           ; the image
+    mov rsi, rdx                           ; the path
+    call image_init
+    invoke(mem_zero, rbx, sizeof(image))
+
+    invoke(MultiByteToWideChar, CP_UTF8, 0, rsi, -1, image_load_wide&, 520)
+    vcall(image_wic, IWICImagingFactoryVtbl.CreateDecoderFromFilename, image_load_wide&, 0, GENERIC_READ,
+          WICDecodeOptions.WICDecodeMetadataCacheOnDemand, image_load_decoder&)
+    test eax, eax
+    jns opened
+    xor eax, eax
+    jmp done
+  opened:
+    vcall(image_load_decoder, IWICBitmapDecoderVtbl.GetFrame, 0, image_load_frame&)
+    vcall(image_wic, IWICImagingFactoryVtbl.CreateFormatConverter, image_load_converter&)
+    ; Whatever the file holds, convert it to 8-bit RGBA. The fifth argument
+    ; past `this`, alphaThresholdPercent, is a double on the stack; 0 as 64
+    ; bits is 0.0.
+    vcall(image_load_converter, IWICFormatConverterVtbl.Initialize, image_load_frame, GUID_WICPixelFormat32bppRGBA&,
+          WICBitmapDitherType.WICBitmapDitherTypeNone, 0, 0, WICBitmapPaletteType.WICBitmapPaletteTypeCustom)
+    vcall(image_load_converter, IWICFormatConverterVtbl.GetSize, image_load_w&, image_load_h&)
+    mov eax, image_load_w
+    mul image_load_h
+    shl rax, 2
+    mov image_load_bytes, rax
+    invoke(arenaPush, arena&, rax, 16)
+    mov [rbx].image.pixels, rax
+    mov eax, image_load_w
+    mov [rbx].image.width, eax
+    mov eax, image_load_h
+    mov [rbx].image.height, eax
+    mov eax, image_load_w
+    shl eax, 2                             ; the stride
+    vcall(image_load_converter, IWICFormatConverterVtbl.CopyPixels, 0, rax, image_load_bytes, [rbx].image.pixels)
+    release(image_load_converter)
+    release(image_load_frame)
+    release(image_load_decoder)
+    mov rax, [rbx].image.pixels
+  done:
+    add rsp, 56
+    pop rsi
+    pop rbx
+    ret
+}
+
+; rcx: text, rdx: position -> eax: the decimal number there, rdx: just past it
+image_number: proc(text: *const c8, at: u64) -> u32 = {
+    xor eax, eax
+  digits:
+    movzx r8d, byte ptr [rcx + rdx]
+    sub r8d, '0'
+    cmp r8d, 9
+    ja done
+    imul eax, eax, 10
+    add eax, r8d
+    inc rdx
+    jmp digits
+  done:
+    ret
+}
+
+; rcx: image, rdx: path -> rax: the pixels (four floats each: linear RGB,
+; a = 1), 0 if the file cannot be read
+;
+; Radiance .hdr stores each pixel as RGBE: three 8-bit mantissas sharing one
+; 8-bit exponent. The header is text up to a blank line, then the size ("-Y
+; height +X width", rows from the top). Each row is run-length encoded one
+; channel at a time: a count above 128 repeats the next byte (count - 128)
+; times, any other count is followed by that many bytes.
+image_load_hdr: proc(out: *image, path: *const c8) -> *u8 = {
+    push rbx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 64                            ; CreateFileA takes 7: 32 + 24; entry 8 + seven pushes 56 + 64 lands on 16
+    mov rbx, rcx                           ; the image
+    mov rsi, rdx                           ; the path, until the file is read
+    call image_init
+    invoke(mem_zero, rbx, sizeof(image))
+
+    ; the whole file
+    invoke(CreateFileA, rsi, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0)
+    cmp rax, INVALID_HANDLE_VALUE
+    jne opened
+    xor eax, eax
+    jmp done
+  opened:
+    mov image_hdr_file, rax
+    invoke(GetFileSizeEx, rax, image_hdr_size&)
+    mov rax, image_hdr_size.QuadPart
+    inc rax
+    invoke(arenaPush, arena&, rax, 16)
+    mov rsi, rax                           ; the data
+    mov r8d, image_hdr_size.u.LowPart        ; 32 bits: loaded straight into its argument register
+    invoke(ReadFile, image_hdr_file, rsi, r8, image_hdr_got&, 0)
+    invoke(CloseHandle, image_hdr_file)
+    mov rax, image_hdr_size.QuadPart
+    mov byte ptr [rsi + rax], 0
+    cmp word ptr [rsi], 0x3F23             ; "#?", little-endian
+    je header
+    xor eax, eax
+    jmp done
+  header:
+
+    ; past the header's blank line, then "-Y height +X width"
+    xor edx, edx
+  blank:
+    cmp byte ptr [rsi + rdx], 10
+    jne not_blank
+    cmp byte ptr [rsi + rdx + 1], 10
+    je found_blank
+  not_blank:
+    inc rdx
+    jmp blank
+  found_blank:
+    add rdx, 5                             ; the blank line and "-Y "
+    mov rcx, rsi
+    call image_number
+    mov [rbx].image.height, eax
+    mov image_hdr_h, rax
+    add rdx, 4                             ; " +X "
+    mov rcx, rsi
+    call image_number
+    mov [rbx].image.width, eax
+    mov image_hdr_w, rax
+    inc rdx
+    mov rdi, rdx                           ; rdi: where the pixels start
+
+    mov rax, image_hdr_w
+    mul image_hdr_h
+    shl rax, 4
+    invoke(arenaPush, arena&, rax, 16)
+    mov [rbx].image.pixels, rax
+    mov r15, rax                           ; next pixel out
+    mov rax, image_hdr_w
+    shl rax, 2
+    invoke(arenaPush, arena&, rax, 16)
+    mov image_hdr_row, rax
+
+    xor r12, r12                           ; y
+  rows:
+    add rdi, 4                             ; 2, 2, then the width again
+    xor r13, r13                           ; channel
+  channels:
+    xor r14, r14                           ; x
+  runs:
+    cmp r14, image_hdr_w
+    jae channel_done
+    movzx ecx, byte ptr [rsi + rdi]
+    inc rdi
+    mov r8, image_hdr_row
+    lea r8, [r8 + r14 * 4]
+    add r8, r13                            ; &row[x * 4 + channel]
+    add r14, rcx
+    cmp ecx, 128
+    jbe literal
+    sub ecx, 128
+    sub r14, 128
+    mov al, [rsi + rdi]
+    inc rdi
+  repeat_byte:
+    mov [r8], al
+    add r8, 4
+    dec ecx
+    jnz repeat_byte
+    jmp runs
+  literal:
+    test ecx, ecx
+    jz runs
+  copy_byte:
+    mov al, [rsi + rdi]
+    mov [r8], al
+    inc rdi
+    add r8, 4
+    dec ecx
+    jnz copy_byte
+    jmp runs
+  channel_done:
+    inc r13
+    cmp r13, 4
+    jb channels
+
+    ; mantissa / 256 * 2^(e - 128) = mantissa * 2^(e - 136), and e = 0 means
+    ; black. 2^(e - 136) is built straight from its bits: a float's exponent
+    ; field holds e - 136 + 127.
+    mov r8, image_hdr_row
+    xor r14, r14
+  pixels:
+    movzx eax, byte ptr [r8 + r14 * 4 + 3]
+    sub eax, 9
+    jg normal_scale
+    xor eax, eax                           ; too small for a normal float: black
+    jmp have_scale
+  normal_scale:
+    shl eax, 23
+  have_scale:
+    movd xmm1, eax
+    shufps xmm1, xmm1, 0
+    pmovzxbd xmm0, dword ptr [r8 + r14 * 4]
+    cvtdq2ps xmm0, xmm0
+    mulps xmm0, xmm1
+    movups xmmword ptr [r15], xmm0
+    mov dword ptr [r15 + 12], 0x3F800000   ; a = 1
+    add r15, 16
+    inc r14
+    cmp r14, image_hdr_w
+    jb pixels
+    inc r12
+    cmp r12, image_hdr_h
+    jb rows
+
+    mov rax, [rbx].image.pixels
+  done:
+    add rsp, 64
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+}

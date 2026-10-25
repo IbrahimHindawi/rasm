@@ -1,0 +1,143 @@
+; 1.1 Depth testing
+;
+; The depth buffer holds, per pixel, how far away the nearest surface drawn so
+; far is. Each new pixel is compared against it (here: keep it if LESS) and
+; either replaces it or is thrown away. That is what has quietly been making
+; the cubes hide each other since 1.6.1 coordinate systems; D3D has the test
+; on by default.
+;
+; Tab shows the depth itself. It is not linear: perspective spends most of the
+; 0..1 range just in front of the camera, so nearly everything reads as white.
+; Undoing the projection gives the real distance, the third view. D3D's depth
+; runs 0..1 where GL's runs -1..1, so the formula differs from LearnOpenGL's
+; by that remapping.
+;
+;   Tab   textured / raw depth / linear depth
+;
+; From this chapter on, draw_vertices (includes/learn/transforms.rasm) draws
+; any vertex buffer of position-normal-uv vertices with a model matrix, and
+; bind_texture puts one texture in a register.
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/cube.rasm"
+import "../../../includes/learn/camera.rasm"
+import "../../../includes/learn/transforms.rasm"
+
+; A floor: two triangles at y = -0.5, the texture repeated twice across.
+plane_vertices: [48]const f32 = {
+    ; position             normal              uv
+    -5.0, -0.5,  5.0,     0.0, 1.0, 0.0,     0.0, 2.0,
+     5.0, -0.5,  5.0,     0.0, 1.0, 0.0,     2.0, 2.0,
+     5.0, -0.5, -5.0,     0.0, 1.0, 0.0,     2.0, 0.0,
+    -5.0, -0.5,  5.0,     0.0, 1.0, 0.0,     0.0, 2.0,
+     5.0, -0.5, -5.0,     0.0, 1.0, 0.0,     2.0, 0.0,
+    -5.0, -0.5, -5.0,     0.0, 1.0, 0.0,     0.0, 0.0,
+}
+
+; Mirrors `cbuffer view_mode` in depth_testing.hlsl.
+view_constants: struct = {
+    mode: u32                              ; 0 textured, 1 raw depth, 2 linear depth
+    near_plane: f32
+    far_plane: f32
+    pad: f32
+}
+
+camera_start: const vec3 = { -1.0, 1.0, 4.0 }
+cube_a: const vec3 = { -1.0, 0.0, -1.0 }
+cube_b: const vec3 = { 2.0, 0.0, 0.0 }
+clear_color: [4]const f32 = { 0.1, 0.1, 0.1, 1.0 }
+
+t: transforms = {}
+v: view_constants = { .near_plane = 0.1, .far_plane = 100.0 }
+model: mat4 = {}
+s: shader = {}
+cam: camera = {}
+cube_vb: *ID3D11Buffer = {}
+plane_vb: *ID3D11Buffer = {}
+transforms_buffer: *ID3D11Buffer = {}
+view_buffer: *ID3D11Buffer = {}
+cube_texture: *ID3D11ShaderResourceView = {}
+floor_texture: *ID3D11ShaderResourceView = {}
+sampler: *ID3D11SamplerState = {}
+
+; timing
+delta_time: f32 = 0.0
+last_frame: f32 = 0.0
+
+main: proc() -> i32 = {
+    sub rsp, 40                            ; draw_vertices takes 5: 32 + 8; entry 8 + 40 lands on 16
+
+    invoke(window_create, "LearnD3D11")
+    call window_create_depth
+    invoke(window_mode_default, 2)
+
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP)
+    mov sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 0, 1, sampler&)
+
+    invoke(shader_create, s&, "src/4.advanced_d3d11/1.1.depth_testing/depth_testing.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, cube_vertices&, sizeof(cube_vertices))
+    mov cube_vb, rax
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, plane_vertices&, sizeof(plane_vertices))
+    mov plane_vb, rax
+    invoke(create_constant_buffer, sizeof(transforms))
+    mov transforms_buffer, rax
+    invoke(create_constant_buffer, sizeof(view_constants))
+    mov view_buffer, rax
+    invoke(filesystem_path, "resources/textures/marble.jpg")
+    invoke(load_texture, rax, 0)
+    mov cube_texture, rax
+    invoke(filesystem_path, "resources/textures/metal.png")
+    invoke(load_texture, rax, 0)
+    mov floor_texture, rax
+
+    lea rcx, cam
+    lea rdx, camera_start
+    movss xmm2, -75.0                      ; yaw
+    movss xmm3, -15.0                      ; pitch
+    call camera_create
+
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    call get_time
+    movss xmm1, xmm0
+    subss xmm0, last_frame
+    movss delta_time, xmm0
+    movss last_frame, xmm1
+
+    invoke(camera_process_input, cam&, delta_time&)
+    invoke(window_mode, 3)
+    mov v.mode, eax
+
+    invoke(window_begin, clear_color&)
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    invoke(bind_constants, 0, transforms_buffer)
+    invoke(transforms_from_camera, t&, cam&)
+    invoke(update_buffer, view_buffer, v&, sizeof(view_constants))
+    invoke(shader_use, s&)
+    invoke(bind_constants, 1, view_buffer)
+
+    ; the floor, then two cubes on it
+    invoke(bind_texture, 0, floor_texture)
+    invoke(m4_identity, model&)
+    invoke(draw_vertices, transforms_buffer, t&, plane_vb, 6, model&)
+    invoke(bind_texture, 0, cube_texture)
+    invoke(m4_translate, model&, cube_a&)
+    invoke(draw_vertices, transforms_buffer, t&, cube_vb, 36, model&)
+    invoke(m4_translate, model&, cube_b&)
+    invoke(draw_vertices, transforms_buffer, t&, cube_vb, 36, model&)
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

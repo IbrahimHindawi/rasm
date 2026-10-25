@@ -1,0 +1,223 @@
+; 1.1 PBR lighting
+;
+; Physically based rendering replaces Phong's hand-tuned terms with a model of
+; how light actually reflects off a rough surface: Cook-Torrance. A material
+; is no longer "diffuse colour, specular colour, shininess" but:
+;
+;   albedo     the base colour
+;   metallic   0 for dielectrics (plastic, wood), 1 for metals
+;   roughness  0 a mirror, 1 completely matte
+;   ao         how much ambient light reaches it, baked in
+;
+; Energy is conserved: whatever a surface reflects as specular it cannot also
+; scatter as diffuse. The lights are given as radiance in real units, far
+; above 1, so the result is tone mapped (Reinhard) and gamma encoded on the
+; way out.
+;
+; The grid runs metallic 0 -> 1 from bottom to top, roughness 0 -> 1 from left
+; to right. Tab swaps in a textured material, where every one of those numbers
+; comes from a map per texel: rusted iron (LearnOpenGL's 1.2
+; lighting_textured). The normal map is read without stored tangents: the
+; tangent frame is rebuilt per pixel from screen-space derivatives.
+;
+;   Tab   uniform grid / textured spheres
+;
+; The sphere, the material loader and the sRGB backbuffer view are in
+; includes/learn/pbr.rasm, which the rest of the chapter shares.
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/cube.rasm"
+import "../../../includes/learn/camera.rasm"
+import "../../../includes/learn/transforms.rasm"
+import "../../../includes/learn/pbr.rasm"
+
+; Mirror `cbuffer material` and `cbuffer lights` in pbr.hlsl.
+material_constants: struct = {
+    albedo: vec3
+    metallic: f32
+    roughness: f32
+    ao: f32
+    textured: u32
+    pad: f32
+}
+
+lights_constants: struct = {
+    positions: [4]vec4
+    colors: [4]vec4
+}
+
+camera_start: const vec3 = { 0.0, 0.0, 22.0 }
+clear_color: [4]const f32 = { 0.1, 0.1, 0.1, 1.0 }
+; four lights at the corners of a square in front of the grid, far brighter
+; than 1. Each frame moves their x from here.
+light_start: [4]const vec4 = {
+    { -10.0,  10.0, 10.0, 0.0 },
+    {  10.0,  10.0, 10.0, 0.0 },
+    { -10.0, -10.0, 10.0, 0.0 },
+    {  10.0, -10.0, 10.0, 0.0 },
+}
+
+t: transforms = {}
+; masm64-dx11 copied light_start and the colour in at startup; here both are
+; the initialiser, and only the x of each position changes.
+lights: lights_constants = {
+    .positions = {
+        { -10.0,  10.0, 10.0, 0.0 },
+        {  10.0,  10.0, 10.0, 0.0 },
+        { -10.0, -10.0, 10.0, 0.0 },
+        {  10.0, -10.0, 10.0, 0.0 },
+    },
+    .colors = {
+        { 300.0, 300.0, 300.0, 0.0 },
+        { 300.0, 300.0, 300.0, 0.0 },
+        { 300.0, 300.0, 300.0, 0.0 },
+        { 300.0, 300.0, 300.0, 0.0 },
+    },
+}
+material: material_constants = { .albedo = { 0.5, 0.0, 0.0 }, .ao = 1.0 }
+model_matrix: mat4 = {}
+sphere_position: vec3 = {}                 ; z stays 0
+s: shader = {}
+cam: camera = {}
+ball: sphere = {}
+transforms_buffer: *ID3D11Buffer = {}
+material_buffer: *ID3D11Buffer = {}
+lights_buffer: *ID3D11Buffer = {}
+sampler: *ID3D11SamplerState = {}
+rusted_iron: [5]*ID3D11ShaderResourceView = {}
+
+; timing
+current_frame: f32 = 0.0
+delta_time: f32 = 0.0
+last_frame: f32 = 0.0
+
+main: proc() -> i32 = {
+    push rbx
+    push rsi
+    sub rsp, 40                            ; 4 arguments at most: 32; entry 8 + two pushes 16 + 40 lands on 16
+
+    invoke(window_create, "LearnD3D11  (Tab: uniform grid / textured)")
+    call window_create_depth
+    call window_use_srgb
+
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP)
+    mov sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 0, 1, sampler&)
+
+    ; build and compile shaders
+    ; -------------------------
+    invoke(shader_create, s&, "src/6.pbr/1.1.lighting/pbr.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+
+    ; set up vertex data and textures
+    ; -------------------------------
+    invoke(create_sphere, ball&, 64)
+    invoke(create_constant_buffer, sizeof(transforms))
+    mov transforms_buffer, rax
+    invoke(create_constant_buffer, sizeof(material_constants))
+    mov material_buffer, rax
+    invoke(create_constant_buffer, sizeof(lights_constants))
+    mov lights_buffer, rax
+    invoke(load_material, "resources/textures/pbr/rusted_iron/", rusted_iron&)
+
+    lea rcx, cam
+    lea rdx, camera_start
+    movss xmm2, -90.0                      ; yaw
+    movss xmm3, 0.0                        ; pitch
+    call camera_create
+
+    ; render loop
+    ; -----------
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    ; per-frame time logic
+    call get_time
+    movss current_frame, xmm0
+    movss xmm1, xmm0
+    subss xmm0, last_frame
+    movss delta_time, xmm0
+    movss last_frame, xmm1
+
+    ; input
+    invoke(camera_process_input, cam&, delta_time&)
+    invoke(window_mode, 2)
+    mov material.textured, eax
+
+    ; render
+    invoke(window_begin, clear_color&)
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    invoke(bind_constants, 0, transforms_buffer)
+    invoke(transforms_from_camera, t&, cam&)
+
+    ; the lights wander a little, so the highlights move across the spheres:
+    ; x = -10 or 10, + 5 sin(t)
+    movss xmm0, current_frame
+    call sinf
+    mulss xmm0, 5.0
+    lea rax, lights.positions
+    lea rdx, light_start
+    xor ecx, ecx
+  wander:
+    movss xmm1, dword ptr [rdx]            ; the start's x
+    addss xmm1, xmm0
+    movss dword ptr [rax], xmm1
+    add rax, sizeof(vec4)
+    add rdx, sizeof(vec4)
+    inc ecx
+    cmp ecx, 4
+    jb wander
+    invoke(update_buffer, lights_buffer, lights&, sizeof(lights_constants))
+    invoke(shader_use, s&)
+    invoke(bind_constants, 1, material_buffer)
+    invoke(bind_constants, 2, lights_buffer)
+    vcall(context, ID3D11DeviceContextVtbl.PSSetShaderResources, 0, 5, rusted_iron&)
+
+    ; render rows*column number of spheres with varying metallic/roughness
+    ; values: metallic from bottom to top, roughness from left to right
+    xor ebx, ebx                           ; row
+  grid_rows:
+    xor esi, esi                           ; column
+  grid_columns:
+    cvtsi2ss xmm0, ebx
+    divss xmm0, 6.0
+    movss material.metallic, xmm0
+    ; perfectly smooth reflects one point of light, which looks wrong for a
+    ; point light: start just above zero
+    cvtsi2ss xmm0, esi
+    divss xmm0, 6.0
+    movss xmm1, 0.05                       ; clampf(x, lo, hi): xmm0, xmm1, xmm2
+    movss xmm2, math_one
+    call clampf
+    movss material.roughness, xmm0
+    invoke(update_buffer, material_buffer, material&, sizeof(material_constants))
+    ; at ((column - 3) * 2.5, (row - 3) * 2.5, 0)
+    movss xmm1, 2.5
+    lea eax, [esi - 3]
+    cvtsi2ss xmm0, eax
+    mulss xmm0, xmm1
+    movss sphere_position.x, xmm0
+    lea eax, [ebx - 3]
+    cvtsi2ss xmm0, eax
+    mulss xmm0, xmm1
+    movss sphere_position.y, xmm0
+    invoke(m4_translate, model_matrix&, sphere_position&)
+    invoke(draw_sphere, transforms_buffer, t&, ball&, model_matrix&)
+    inc esi
+    cmp esi, 7
+    jb grid_columns
+    inc ebx
+    cmp ebx, 7
+    jb grid_rows
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

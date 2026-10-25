@@ -1,0 +1,183 @@
+; 5.1 Light casters
+;
+; Three kinds of light, which differ only in how each pixel finds the
+; direction to the light and how much of it arrives:
+;
+;   1 directional  infinitely far, like the sun: one direction for every
+;                  pixel, no falloff
+;   2 point        a position, light spreading out from it and fading with
+;                  distance: 1 / (constant + linear * d + quadratic * d^2)
+;   3 spot         a point light inside a cone, here a flashlight held by the
+;                  camera. Between an inner and an outer angle the edge
+;                  fades, so the circle is soft rather than cut out
+;
+; Keys 1, 2 and 3 (or Tab) switch between them; --mode 0, 1, 2 picks one for
+; a --shot.
+;
+;   W A S D, Space, Shift   move
+;   right mouse + drag      look
+;   wheel                   zoom
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/cube.rasm"
+import "../../../includes/learn/camera.rasm"
+import "../../../includes/learn/transforms.rasm"
+
+; Mirrors `cbuffer light` in light_casters.hlsl.
+light_constants: struct = {
+    position: vec3
+    mode: u32                              ; 1 directional, 2 point, 3 spot
+    direction: vec3
+    inner_cos: f32                         ; cosines, so the shader compares without an acos
+    ambient: vec3
+    outer_cos: f32
+    diffuse: vec3
+    shininess: f32
+    specular: vec3
+    pad: f32
+}
+
+camera_start: const vec3 = { 0.0, 0.0, 3.0 }
+point_position: const vec3 = { 1.2, 1.0, 2.0 }
+sun_direction: const vec3 = { -0.2, -1.0, -0.3 }
+clear_color: [4]const f32 = { 0.1, 0.1, 0.1, 1.0 }
+
+t: transforms = {}
+light: light_constants = {
+    .ambient = { 0.1, 0.1, 0.1 },
+    .diffuse = { 0.8, 0.8, 0.8 },
+    .shininess = 32.0,
+    .specular = { 1.0, 1.0, 1.0 },
+}                                          ; the rest is set at run time
+lamp_color: const vec4 = { 1.0, 1.0, 1.0, 1.0 }
+model: mat4 = {}
+lighting_shader: shader = {}
+lamp_shader: shader = {}
+cam: camera = {}
+cube_vb: *ID3D11Buffer = {}
+transforms_buffer: *ID3D11Buffer = {}
+light_buffer: *ID3D11Buffer = {}
+lamp_buffer: *ID3D11Buffer = {}
+sampler: *ID3D11SamplerState = {}
+maps: [2]*ID3D11ShaderResourceView = {}
+stride: u32 = CUBE_STRIDE
+offset: u32 = 0
+
+; timing
+delta_time: f32 = 0.0
+last_frame: f32 = 0.0
+
+main: proc() -> i32 = {
+    push rbx
+    sub rsp, 48                            ; IASetVertexBuffers: 5 past `this`, 2 on the stack: 32 + 16; entry 8 + push 8 + 48 lands on 16
+    invoke(window_create, "LearnD3D11")
+    call window_create_depth
+    invoke(window_mode_default, 2)         ; starts as the flashlight
+
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP)
+    mov sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 0, 1, sampler&)
+
+    invoke(shader_create, lighting_shader&, "src/2.lighting/5.1.light_casters/light_casters.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+    invoke(shader_create, lamp_shader&, "src/2.lighting/5.1.light_casters/light_cube.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, cube_vertices&, sizeof(cube_vertices))
+    mov cube_vb, rax
+    invoke(create_constant_buffer, sizeof(transforms))
+    mov transforms_buffer, rax
+    invoke(create_constant_buffer, sizeof(light_constants))
+    mov light_buffer, rax
+    invoke(create_constant_buffer, sizeof(vec4))
+    mov lamp_buffer, rax
+    invoke(filesystem_path, "resources/textures/container2.png")
+    invoke(load_texture, rax, 0)
+    mov maps[0], rax
+    invoke(filesystem_path, "resources/textures/container2_specular.png")
+    invoke(load_texture, rax, 0)
+    mov maps[1], rax
+
+    ; the spot's cone: 12.5 degrees fully lit, fading out by 17.5
+    movss xmm0, 12.5
+    call radians
+    call cosf
+    movss light.inner_cos, xmm0
+    movss xmm0, 17.5
+    call radians
+    call cosf
+    movss light.outer_cos, xmm0
+
+    lea rcx, cam
+    lea rdx, camera_start
+    movss xmm2, -90.0                      ; yaw
+    xorps xmm3, xmm3                       ; pitch 0
+    call camera_create
+
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    call get_time
+    movss xmm1, xmm0
+    subss xmm0, last_frame
+    movss delta_time, xmm0
+    movss last_frame, xmm1
+
+    invoke(camera_process_input, cam&, delta_time&)
+    invoke(window_mode, 3)
+    inc eax                                ; modes count from 0, the shader's from 1
+    mov light.mode, eax
+
+    invoke(window_begin, clear_color&)
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    vcall(context, ID3D11DeviceContextVtbl.IASetVertexBuffers, 0, 1, cube_vb&, stride&, offset&)
+    invoke(bind_constants, 0, transforms_buffer)
+    invoke(transforms_from_camera, t&, cam&)
+
+    ; the point light sits still; the sun shines one way; the flashlight is the camera
+    v3load_var(xmm0, point_position)
+    v3store_var(light.position, xmm0)
+    v3load_var(xmm0, sun_direction)
+    v3store_var(light.direction, xmm0)
+    cmp light.mode, 3
+    jne not_spot
+    v3load_var(xmm0, cam.position)
+    v3store_var(light.position, xmm0)
+    v3load_var(xmm0, cam.front)
+    v3store_var(light.direction, xmm0)
+  not_spot:
+    invoke(update_buffer, light_buffer, light&, sizeof(light_constants))
+    invoke(shader_use, lighting_shader&)
+    invoke(bind_constants, 1, light_buffer)
+    vcall(context, ID3D11DeviceContextVtbl.PSSetShaderResources, 0, 2, maps&)
+    xor ebx, ebx
+  cubes:
+    invoke(cube_model, model&, rbx)
+    invoke(draw_cube, transforms_buffer, t&, model&)
+    inc ebx
+    cmp ebx, 10
+    jb cubes
+
+    ; only the point light is somewhere to draw a lamp
+    cmp light.mode, 2
+    jne no_lamp
+    invoke(update_buffer, lamp_buffer, lamp_color&, sizeof(vec4))
+    invoke(shader_use, lamp_shader&)
+    invoke(bind_constants, 1, lamp_buffer)
+    lea rcx, model
+    lea rdx, point_position
+    movss xmm2, 0.2                        ; the scale, the third argument
+    call m4_translate_scale
+    invoke(draw_cube, transforms_buffer, t&, model&)
+  no_lamp:
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)                 ; does not return: no epilogue
+}

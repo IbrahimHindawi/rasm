@@ -1,0 +1,281 @@
+; 7. Advanced data
+;
+; Two things about vertex buffers that the earlier lessons did not need:
+;
+;   * a buffer the CPU rewrites. The water's heights are computed here every
+;     frame and copied into a DYNAMIC buffer with Map(WRITE_DISCARD): the
+;     driver hands back fresh memory, so the GPU can still be reading last
+;     frame's copy while this one is written. (GL: glBufferSubData, or
+;     glMapBuffer.)
+;   * attributes in separate buffers. Positions change every frame and colours
+;     never do, so they live apart: slot 0 is rewritten, slot 1 uploaded once.
+;     The input layout says which slot each attribute reads.
+;
+; The index buffer, which says how the grid's points form triangles, never
+; changes either. LearnOpenGL's chapter on this has no program; this is one.
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/camera.rasm"
+
+; GRID points along each side; two triangles, six indices, to each square of
+; four points
+#define GRID 96
+#define GRID_POINTS (GRID * GRID)
+#define INDEX_COUNT ((GRID - 1) * (GRID - 1) * 6)
+
+grid_size: const f32 = 8.0                     ; world units along each side
+
+; Positions from slot 0, colours from slot 1.
+water_layout: [2]const D3D11_INPUT_ELEMENT_DESC = {
+    { .SemanticName = "POSITION", .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32B32_FLOAT, .InputSlot = 0 },
+    { .SemanticName = "COLOR", .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32B32_FLOAT, .InputSlot = 1 },
+}
+
+; the same rasterizer state as window.rasm's, drawing only the edges
+wire_desc: const D3D11_RASTERIZER_DESC = {
+    .FillMode = D3D11_FILL_MODE.D3D11_FILL_WIREFRAME,
+    .CullMode = D3D11_CULL_MODE.D3D11_CULL_NONE,
+    .FrontCounterClockwise = 1,
+    .DepthClipEnable = 1,
+}
+
+; Positions: DYNAMIC, so the CPU may write them; nothing to start with.
+position_desc: const D3D11_BUFFER_DESC = {
+    .ByteWidth = sizeof(vec3) * GRID_POINTS,
+    .Usage = D3D11_USAGE.D3D11_USAGE_DYNAMIC,
+    .BindFlags = D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER,
+    .CPUAccessFlags = D3D11_CPU_ACCESS_FLAG.D3D11_CPU_ACCESS_WRITE,
+}
+
+; Mirrors `cbuffer transforms` in advanced_data.hlsl: this lesson's has only the camera.
+water_transforms: struct = {
+    view: mat4
+    projection: mat4
+}
+
+camera_start: const vec3 = { 0.0, 3.0, 7.0 }
+clear_color: [4]const f32 = { 0.05, 0.05, 0.08, 1.0 }
+
+; masm64-dx11 pushed these three onto the arena. Their sizes are known
+; before the program runs, so here they are arrays, which the debugger shows
+; element by element.
+positions: [GRID_POINTS]vec3 = {}              ; rewritten every frame
+colors: [GRID_POINTS]vec3 = {}
+indices: [INDEX_COUNT]u32 = {}
+
+t: water_transforms = {}
+s: shader = {}
+cam: camera = {}
+position_buffer: *ID3D11Buffer = {}
+color_buffer: *ID3D11Buffer = {}
+index_buffer: *ID3D11Buffer = {}
+transforms_buffer: *ID3D11Buffer = {}
+wire_state: *ID3D11RasterizerState = {}
+water_buffers: [2]*ID3D11Buffer = {}           ; slot 0, slot 1
+water_strides: [2]u32 = { 12, 12 }
+water_offsets: [2]u32 = { 0, 0 }
+wx: f32 = 0.0                                  ; main's: a point's x, across the call that works out z
+
+; timing
+current_frame: f32 = 0.0
+delta_time: f32 = 0.0
+last_frame: f32 = 0.0
+
+; wave_height's: MASM's locals
+wave_height_x: f32 = 0.0
+wave_height_z: f32 = 0.0
+wave_height_time: f32 = 0.0
+wave_height_sum: f32 = 0.0
+
+; xmm0: x, xmm1: z, xmm2: time -> xmm0: the water's height there, three waves summed
+;
+;   0.25 sin(1.3 x + 1.7 t) + 0.15 sin(2.1 z - 1.1 t) + 0.08 sin(3.7 (x + z) + 2.3 t)
+wave_height: proc(x: f32, z: f32, time: f32) -> f32 = {
+    ; sinf keeps its float in its shadow space, so even this proc, which saves
+    ; nothing, reserves one: 32, and 8 to put rsp back on 16.
+    sub rsp, 40
+    movss wave_height_x, xmm0
+    movss wave_height_z, xmm1
+    movss wave_height_time, xmm2
+    mulss xmm0, 1.3
+    movss xmm1, xmm2
+    mulss xmm1, 1.7
+    addss xmm0, xmm1
+    call sinf
+    mulss xmm0, 0.25
+    movss wave_height_sum, xmm0
+    movss xmm0, wave_height_z
+    mulss xmm0, 2.1
+    movss xmm1, wave_height_time
+    mulss xmm1, 1.1
+    subss xmm0, xmm1
+    call sinf
+    mulss xmm0, 0.15
+    addss xmm0, wave_height_sum
+    movss wave_height_sum, xmm0
+    movss xmm0, wave_height_x
+    addss xmm0, wave_height_z
+    mulss xmm0, 3.7
+    movss xmm1, wave_height_time
+    mulss xmm1, 2.3
+    addss xmm0, xmm1
+    call sinf
+    mulss xmm0, 0.08
+    addss xmm0, wave_height_sum
+    add rsp, 40
+    ret
+}
+
+; xmm0: i (0 .. GRID - 1) -> xmm0: (i / (GRID - 1) - 0.5) * grid_size, the
+; world coordinate. A leaf: no frame.
+grid_coordinate: proc(i: f32) -> f32 = {
+    divss xmm0, 95.0                           ; GRID - 1
+    subss xmm0, math_half
+    mulss xmm0, grid_size
+    ret
+}
+
+main: proc() -> i32 = {
+    push rsi
+    push rdi
+    push r12
+    push r13
+    sub rsp, 56                                ; IASetVertexBuffers takes 6: 32 + 16; entry 8 + four pushes 32 + 56 lands on 16
+
+    invoke(window_create, "LearnD3D11")
+    call window_create_depth
+
+    vcall(device, ID3D11DeviceVtbl.CreateRasterizerState, wire_desc&, wire_state&)
+
+    invoke(shader_create, s&, "src/4.advanced_d3d11/7.advanced_data/advanced_data.hlsl", water_layout&, 2)
+
+    ; the grid: colours by depth, and two triangles to each square of four points
+    lea rsi, colors
+    lea rdi, indices
+    xor r12d, r12d                             ; z
+  rows:
+    ; colour = (0.1, 0.35 + 0.4 fz, 0.6 + 0.3 fz), fz = z / (GRID - 1)
+    cvtsi2ss xmm0, r12d
+    divss xmm0, 95.0
+    movss xmm1, 0.4
+    mulss xmm1, xmm0
+    addss xmm1, 0.35
+    movss xmm2, 0.3
+    mulss xmm2, xmm0
+    addss xmm2, 0.6
+    xor r13d, r13d                             ; x
+  columns:
+    mov [rsi].vec3.x, 0x3DCCCCCD               ; 0.1, as an immediate: its bits
+    movss [rsi].vec3.y, xmm1
+    movss [rsi].vec3.z, xmm2
+    add rsi, sizeof(vec3)
+    cmp r13d, GRID - 1
+    jae no_quad
+    cmp r12d, GRID - 1
+    jae no_quad
+    ; a = z * GRID + x, b = a + GRID: (a, b, b + 1), (a, b + 1, a + 1)
+    imul eax, r12d, GRID
+    add eax, r13d
+    lea edx, [rax + GRID]
+    mov dword ptr [rdi + 0], eax
+    mov dword ptr [rdi + 4], edx
+    lea ecx, [rdx + 1]
+    mov dword ptr [rdi + 8], ecx
+    mov dword ptr [rdi + 12], eax
+    mov dword ptr [rdi + 16], ecx
+    lea ecx, [rax + 1]
+    mov dword ptr [rdi + 20], ecx
+    add rdi, 24
+  no_quad:
+    inc r13d
+    cmp r13d, GRID
+    jb columns
+    inc r12d
+    cmp r12d, GRID
+    jb rows
+
+    vcall(device, ID3D11DeviceVtbl.CreateBuffer, position_desc&, 0, position_buffer&)
+    ; colours and indices: immutable
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, colors&, sizeof(colors))
+    mov color_buffer, rax
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_INDEX_BUFFER, indices&, sizeof(indices))
+    mov index_buffer, rax
+    invoke(create_constant_buffer, sizeof(water_transforms))
+    mov transforms_buffer, rax
+    mov rax, position_buffer
+    mov water_buffers[0], rax
+    mov rax, color_buffer
+    mov water_buffers[1], rax
+
+    lea rcx, cam
+    lea rdx, camera_start
+    movss xmm2, -90.0                          ; yaw
+    movss xmm3, -25.0                          ; pitch
+    call camera_create
+
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    call get_time
+    movss current_frame, xmm0
+    movss xmm1, xmm0
+    subss xmm0, last_frame
+    movss delta_time, xmm0
+    movss last_frame, xmm1
+
+    invoke(camera_process_input, cam&, delta_time&)
+
+    ; this frame's water: every point's height, then the whole buffer rewritten
+    lea rsi, positions
+    xor r12d, r12d                             ; z
+  heights_rows:
+    xor r13d, r13d                             ; x
+  heights_columns:
+    cvtsi2ss xmm0, r13d
+    call grid_coordinate
+    movss wx, xmm0
+    movss [rsi].vec3.x, xmm0
+    cvtsi2ss xmm0, r12d
+    call grid_coordinate
+    movss [rsi].vec3.z, xmm0
+    movaps xmm1, xmm0                          ; z
+    movss xmm0, wx                             ; x
+    movss xmm2, current_frame                  ; time
+    call wave_height
+    movss [rsi].vec3.y, xmm0
+    add rsi, sizeof(vec3)
+    inc r13d
+    cmp r13d, GRID
+    jb heights_columns
+    inc r12d
+    cmp r12d, GRID
+    jb heights_rows
+    invoke(update_buffer, position_buffer, positions&, sizeof(positions))
+
+    invoke(window_begin, clear_color&)
+    invoke(camera_view, t.view&, cam&)
+    invoke(camera_projection, t.projection&, cam&)
+    invoke(update_buffer, transforms_buffer, t&, sizeof(water_transforms))
+    invoke(shader_use, s&)
+    invoke(bind_constants, 0, transforms_buffer)
+
+    ; positions from slot 0, colours from slot 1
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    vcall(context, ID3D11DeviceContextVtbl.IASetVertexBuffers, 0, 2, water_buffers&, water_strides&, water_offsets&)
+    vcall(context, ID3D11DeviceContextVtbl.IASetIndexBuffer, index_buffer, DXGI_FORMAT.DXGI_FORMAT_R32_UINT, 0)
+    vcall(context, ID3D11DeviceContextVtbl.RSSetState, wire_state)
+    vcall(context, ID3D11DeviceContextVtbl.DrawIndexed, INDEX_COUNT, 0, 0)
+    vcall(context, ID3D11DeviceContextVtbl.RSSetState, raster_state)
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

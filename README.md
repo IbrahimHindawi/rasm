@@ -1,20 +1,137 @@
-# rasm
+# rasm-dx11
 
-A rin-shaped assembler for x64 Windows, for playing with D3D11 graphics and raw
-SIMD assembly. rin's declaration syntax and types, x64 instructions written as
-they are, one per line. The assembler generates nothing you did not write: frames,
-shadow space, saved registers and argument moves are yours, or your macros'.
+[LearnOpenGL](https://learnopengl.com/)'s lessons, from the first window to
+image based PBR, rewritten for Windows and Direct3D 11 in x64 assembly:
+**rasm**, the assembler inside the [rin](https://github.com/IbrahimHindawi/rin)
+compiler (`rin asm`). It is the rasm twin of `masm64-dx11`, the same lessons
+in Microsoft's ml64, and of `rin-dx11`, the same lessons in rin, and follows
+them lesson for lesson, down to the shaders, which are shared unchanged.
 
-The code is assembled by clang with a `.cv_loc` per statement and the data is
-compiled as C, so Visual Studio steps through the `.rasm` source exactly as it
-does through MASM source.
+rasm is rin's declaration syntax (structs, enums, globals with initialisers,
+`#define`, `import`) around bodies of Intel-syntax x64 instructions. It adds
+no instruction of its own: frames, shadow space, saved registers and argument
+moves are written out, and `invoke` and `vcall` are ordinary macros in
+`includes/calls.rasm`. The code is assembled by clang with a line record per
+statement and the data is compiled as C, so Visual Studio steps through the
+`.rasm` source and shows every global with its type and field names.
 
-**Status:** design only. Nothing is implemented yet.
+Nothing third-party is linked: the window and input are Win32, images are
+decoded by WIC (Windows Imaging Component), shaders are compiled by
+`D3DCompile`, and the maths and the `.hdr` reader are written in assembly, in
+`includes/`.
 
-- [docs/](docs/README.md): the spec, design, roadmap, decisions, and a working
-  debugging prototype ([docs/debug-proto](docs/debug-proto))
-- [examples/](examples): LearnOpenGL's hello triangle and transformations,
-  hand-written in the proposed syntax, with the call macros and SSE maths
+## Build and run
 
-Related: [rin](https://github.com/IbrahimHindawi/rin) (the language whose front
-end rasm will reuse).
+Needs the rin compiler (`C:\devel\rin\build\rin.exe`, or `RIN` pointing at
+`rin.exe`, or `rin` on `PATH`), clang and lld (LLVM), and the Windows SDK.
+
+    python build.py
+    build\hello_window.exe
+
+`python build.py hello` builds only the lessons whose names contain `hello`.
+Each lesson is its own executable, named after its file, and is one unity
+build: a single `.rasm` that imports everything it uses, so building it is
+one `rin asm`, which leaves the generated `.s` and data `.c` in `build/rasm/`.
+Lessons find `resources/` and their shaders by walking up from the
+executable, so they can be run from anywhere.
+
+| key | does |
+|---|---|
+| W A S D, Space, Shift | fly (from 1.7 on) |
+| right mouse + drag | look around |
+| wheel | zoom |
+| Tab, 1..6 | each lesson's modes |
+| Esc | quit |
+
+From 3.1 on, `--shot out.png` renders a few frames with the clock stopped,
+saves the backbuffer as a PNG and exits, without showing the window; `--time t`
+picks the time (1 second by default) and `--mode n` the mode, counted from 0.
+`python tools/screenshot.py` does that for every built lesson, into `shots/`
+(1.1 and 2.1, which write their window by hand, are captured from outside).
+That is how each lesson here was checked against masm64-dx11's.
+
+## How to read it
+
+Read each lesson's `.rasm` first: it opens with what the lesson is about and
+stays close to the code. The `.hlsl` beside it holds its shaders. The guides
+in `docs/` give the background a single file does not have room for,
+starting with how D3D11's conventions differ from GL's
+(`docs/0_from_gl_to_d3d11.md`) and how the assembly is written
+(`docs/0_rasm.md`).
+
+Early lessons spell out every D3D11 call. Once a call has been explained it
+moves into `includes/`, and later lessons use the procedure:
+
+| file | holds | first explained in |
+|---|---|---|
+| `learn/window.rasm` | window, input, device, swap chain, frame loop, `--shot`: GLFW's part | 1.1, 2.1 |
+| `learn/shader.rasm` | one `.hlsl` file compiled into a shader program | 2.1 |
+| `learn/gpu.rasm` | buffers, constants, textures, samplers, render targets, cubemaps | 2.1 to 6.1 |
+| `math.rasm` | vectors and row-major `mat4`, in SSE | 5.1 |
+| `learn/cube.rasm` | the cube, and where the ten cubes stand | 6.1 |
+| `learn/camera.rasm` | the fly camera | 1.7 |
+| `learn/transforms.rasm` | the per-draw matrices in `b0`, `draw_cube`, `draw_vertices` | 2.1 |
+| `image.rasm` | `.png` / `.jpg` through WIC, and Radiance `.hdr` | 1.4 |
+| `calls.rasm`, `macros.rasm`, `saha.rasm`, `cstr.rasm`, `print.rasm` | `invoke` and `vcall`, asserts and `release`, the arena allocator, strings, `print` | 1.1 |
+| `d3d11.rin`, `gen/` | Win32, COM, D3D11, DXGI, D3DCompiler and WIC: structs, enums, constants, vtables | generated |
+
+`includes/gen/win32_d3d11.rin` is generated from the Windows SDK's headers
+by `includes/gen/gen_bindings.py` with rinbind (libclang). Every struct is
+laid out as the C compiler lays it out, and every offset a program uses is
+checked against C when it is built.
+
+## The lessons
+
+| | lesson | about |
+|---|---|---|
+| **1** | [getting started](docs/1_getting_started.md) | |
+| 1.1 | hello window | a window, a device, a clear colour |
+| 2.1 | hello triangle | buffers, shaders, input layouts, indexed drawing |
+| 3.1 | shaders | per-vertex data and constant buffers |
+| 4.1 | textures | WIC images, mipmaps, samplers |
+| 5.1 | transformations | matrices and their order |
+| 6.1 | coordinate systems | model, view, projection; the depth buffer |
+| 7.1 | camera | a fly camera from yaw and pitch |
+| **2** | [lighting](docs/2_lighting.md) | |
+| 1 | colors | light colour times surface colour |
+| 2.1 | basic lighting | Phong: ambient, diffuse, specular |
+| 3.1 | materials | per-term material and light colours |
+| 4.1 | lighting maps | diffuse and specular textures |
+| 5.1 | light casters | directional, point and spot lights |
+| 6 | multiple lights | summing them |
+| **3** | [model loading](docs/3_model_loading.md) | |
+| 1 | model loading | an `.obj` backpack and its materials |
+| **4** | [advanced D3D11](docs/4_advanced.md) | |
+| 1.1 | depth testing | the depth buffer, and linear depth |
+| 2 | stencil testing | outlines through the stencil buffer |
+| 3.1 | blending | clipped grass, sorted transparent windows |
+| 4 | face culling | winding and back faces |
+| 5.1 | framebuffers | render to texture, post-processing |
+| 6.1 | cubemaps | skybox, reflection, refraction |
+| 7 | advanced data | dynamic and split vertex buffers |
+| 8 | advanced HLSL | shared constant buffers, system values |
+| 9.1 | geometry shader | exploding a model, drawing its normals |
+| 10.1 | instancing | twenty thousand asteroids in one draw |
+| 11.1 | anti-aliasing | MSAA and resolving it |
+| **5** | [advanced lighting](docs/5_advanced_lighting.md) | |
+| 1 | advanced lighting | Blinn-Phong: the halfway vector |
+| 2 | gamma correction | sRGB textures and backbuffer, linear lighting |
+| 3.1 | shadow mapping | directional shadows, hardware PCF |
+| 3.2 | point shadows | a depth cubemap in one pass |
+| 4 | normal mapping | tangent space |
+| 5.1 | parallax mapping | parallax occlusion mapping |
+| 6 | hdr | float targets and tone mapping |
+| 7 | bloom | bright pass, ping-pong blur |
+| 8.1 | deferred shading | the G-buffer, many lights |
+| 9 | ssao | screen-space ambient occlusion |
+| **6** | [pbr](docs/6_pbr.md) | |
+| 1.1 | lighting | Cook-Torrance, metallic and roughness |
+| 2.1 | ibl irradiance | lighting by an HDR environment |
+| 2.2 | ibl specular | prefiltered reflections, the BRDF table |
+
+## Credits
+
+The lessons follow LearnOpenGL by Joey de Vries, rewritten rather than
+translated; its code is CC BY-NC 4.0, and so is this. The textures, models and
+HDR environment come from the LearnOpenGL repository. See
+[NOTICE.md](NOTICE.md).

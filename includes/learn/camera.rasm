@@ -1,0 +1,282 @@
+; camera: a fly camera from yaw and pitch, LearnOpenGL's Camera class
+;
+; Lessons feed it keyboard, mouse and wheel input and ask it for a view matrix:
+;
+;     lea rcx, cam                           ; once
+;     lea rdx, camera_start
+;     movss xmm2, -90.0                      ; yaw: -90 looks down -z
+;     movss xmm3, 0.0                        ; pitch
+;     call camera_create
+;     ...
+;     invoke(camera_process_input, cam&, delta_time&)    ; every frame (delta_time: an f32)
+;     invoke(camera_view, view&, cam&)
+;
+;   W A S D, Space, Shift   move
+;   right mouse + drag      look
+;   wheel                   zoom
+
+import "../d3d11.rin"
+import "../calls.rasm"
+import "../math.rasm"
+import "window.rasm"
+
+#define CAMERA_FORWARD 0
+#define CAMERA_BACKWARD 1
+#define CAMERA_RIGHT 2
+#define CAMERA_LEFT 3
+#define CAMERA_UP 4
+#define CAMERA_DOWN 5
+
+camera: struct = {
+    position: vec3
+    front: vec3
+    up: vec3
+    right: vec3
+    world_up: vec3
+    yaw: f32                               ; degrees; -90 looks down -z
+    pitch: f32                             ; degrees
+    speed: f32                             ; units per second
+    sensitivity: f32                       ; degrees per pixel of mouse movement
+    zoom: f32                              ; vertical field of view, degrees
+}
+
+; the key for each CAMERA_ direction, in order
+camera_keys: [6]const u8 = { 'W', 'S', 'D', 'A', VK_SPACE, VK_SHIFT }
+
+; camera_update_vectors's: math.asm's locals
+camera_update_yaw: f32 = 0.0               ; radians
+camera_update_pitch: f32 = 0.0
+camera_update_cos_pitch: f32 = 0.0
+
+; rcx: camera. front, right and up from yaw and pitch.
+camera_update_vectors: proc(cam: *camera) = {
+    push rbx
+    sub rsp, 32                            ; 32 shadow; entry 8 + push 8 + 32 lands on 16
+    mov rbx, rcx
+    movss xmm0, [rbx].camera.yaw
+    call radians
+    movss camera_update_yaw, xmm0
+    movss xmm0, [rbx].camera.pitch
+    call radians
+    movss camera_update_pitch, xmm0
+    call cosf
+    movss camera_update_cos_pitch, xmm0
+    ; front = normalize(cos(yaw) cos(pitch), sin(pitch), sin(yaw) cos(pitch))
+    movss xmm0, camera_update_yaw
+    call cosf
+    mulss xmm0, camera_update_cos_pitch
+    movss [rbx].camera.front.x, xmm0
+    movss xmm0, camera_update_pitch
+    call sinf
+    movss [rbx].camera.front.y, xmm0
+    movss xmm0, camera_update_yaw
+    call sinf
+    mulss xmm0, camera_update_cos_pitch
+    movss [rbx].camera.front.z, xmm0
+    lea rcx, [rbx].camera.front
+    mov rdx, rcx
+    call v3_normalize
+    ; right = normalize(cross(front, world_up)), up = normalize(cross(right, front))
+    lea rcx, [rbx].camera.right
+    lea rdx, [rbx].camera.front
+    lea r8, [rbx].camera.world_up
+    call v3_cross
+    lea rcx, [rbx].camera.right
+    mov rdx, rcx
+    call v3_normalize
+    lea rcx, [rbx].camera.up
+    lea rdx, [rbx].camera.right
+    lea r8, [rbx].camera.front
+    call v3_cross
+    lea rcx, [rbx].camera.up
+    mov rdx, rcx
+    call v3_normalize
+    add rsp, 32
+    pop rbx
+    ret
+}
+
+; rcx: camera, rdx: position (vec3), xmm2: yaw, xmm3: pitch (degrees)
+camera_create: proc(cam: *camera, position: *const vec3, yaw: f32, pitch: f32) = {
+    mov eax, [rdx].vec3.x
+    mov [rcx].camera.position.x, eax
+    mov eax, [rdx].vec3.y
+    mov [rcx].camera.position.y, eax
+    mov eax, [rdx].vec3.z
+    mov [rcx].camera.position.z, eax
+    mov dword ptr [rcx].camera.world_up.x, 0
+    mov dword ptr [rcx].camera.world_up.y, 0x3F800000    ; 1.0
+    mov dword ptr [rcx].camera.world_up.z, 0
+    movss [rcx].camera.yaw, xmm2
+    movss [rcx].camera.pitch, xmm3
+    movss xmm0, 2.5
+    movss [rcx].camera.speed, xmm0
+    movss xmm0, 0.1
+    movss [rcx].camera.sensitivity, xmm0
+    movss xmm0, 45.0
+    movss [rcx].camera.zoom, xmm0
+    jmp camera_update_vectors              ; rcx is still the camera; it returns for us
+}
+
+camera_view_target: vec3 = {}              ; camera_view's: position + front
+
+; rcx: out mat4, rdx: camera
+camera_view: proc(out: *mat4, cam: *const camera) = {
+    push rbx
+    push rsi
+    sub rsp, 40                            ; 32 shadow; entry 8 + two pushes 16 + 40 lands on 16
+    mov rbx, rcx                           ; out
+    mov rsi, rdx                           ; the camera
+    lea rcx, camera_view_target
+    lea rdx, [rsi].camera.position
+    lea r8, [rsi].camera.front
+    call v3_add
+    lea rdx, [rsi].camera.position
+    lea r9, [rsi].camera.up
+    invoke(m4_look_at, rbx, rdx, camera_view_target&, r9)
+    add rsp, 40
+    pop rsi
+    pop rbx
+    ret
+}
+
+; rcx: out mat4, rdx: camera -> the projection the lessons use: the camera's
+; zoom as the vertical field of view, the window's aspect ratio, and depth
+; from 0.1 to 100 units.
+camera_projection: proc(out: *mat4, cam: *const camera) = {
+    sub rsp, 40                            ; 32 shadow + 1 stack argument, and rsp back on 16
+    movss xmm0, 100.0
+    movss dword ptr [rsp + 32], xmm0       ; z_far, the fifth argument, on the stack
+    movss xmm0, [rdx].camera.zoom
+    call radians                           ; touches xmm0 only: rcx is still out
+    movaps xmm1, xmm0                      ; fovy
+    cvtsi2ss xmm2, scr_width
+    cvtsi2ss xmm0, scr_height
+    divss xmm2, xmm0                       ; aspect
+    movss xmm3, 0.1                        ; z_near
+    call m4_perspective
+    add rsp, 40
+    ret
+}
+
+camera_keyboard_step: vec3 = {}            ; camera_process_keyboard's
+
+; rcx: camera, edx: CAMERA_FORWARD ... CAMERA_DOWN, xmm2: seconds since the last frame
+camera_process_keyboard: proc(cam: *camera, direction: u32, seconds: f32) = {
+    push rbx
+    sub rsp, 32                            ; 32 shadow; entry 8 + push 8 + 32 lands on 16
+    mov rbx, rcx
+    mulss xmm2, [rbx].camera.speed         ; how far this frame
+    mov eax, edx
+    lea rdx, [rbx].camera.front
+    cmp eax, CAMERA_RIGHT
+    jb along
+    lea rdx, [rbx].camera.right
+    cmp eax, CAMERA_UP
+    jb along
+    lea rdx, [rbx].camera.world_up
+  along:
+    ; forward, right and up (even) add the step; backward, left and down (odd) subtract it
+    test eax, 1
+    jz forwards
+    xorps xmm2, math_sign_mask
+  forwards:
+    lea rcx, camera_keyboard_step
+    call v3_scale
+    lea rcx, [rbx].camera.position
+    mov rdx, rcx
+    lea r8, camera_keyboard_step
+    call v3_add
+    add rsp, 32
+    pop rbx
+    ret
+}
+
+; rcx: camera, xmm1: dx, xmm2: dy (pixels; up is positive)
+;
+; Pitch stops short of straight up and down, where the view would flip.
+camera_process_mouse: proc(cam: *camera, dx: f32, dy: f32) = {
+    push rbx
+    sub rsp, 32                            ; 32 shadow; entry 8 + push 8 + 32 lands on 16
+    mov rbx, rcx
+    mulss xmm1, [rbx].camera.sensitivity
+    addss xmm1, [rbx].camera.yaw
+    movss [rbx].camera.yaw, xmm1
+    mulss xmm2, [rbx].camera.sensitivity
+    movss xmm0, [rbx].camera.pitch
+    addss xmm0, xmm2
+    movss xmm1, -89.0
+    movss xmm2, 89.0
+    call clampf
+    movss [rbx].camera.pitch, xmm0
+    mov rcx, rbx
+    call camera_update_vectors
+    add rsp, 32
+    pop rbx
+    ret
+}
+
+; rcx: camera, xmm1: wheel notches. Zooming is narrowing the field of view.
+camera_process_scroll: proc(cam: *camera, notches: f32) = {
+    addss xmm1, xmm1                       ; 2 degrees a notch
+    movss xmm0, [rcx].camera.zoom
+    subss xmm0, xmm1
+    movss xmm1, 1.0
+    movss xmm2, 45.0
+    maxss xmm0, xmm1                       ; clampf, written in place: this is a leaf
+    minss xmm0, xmm2
+    movss [rcx].camera.zoom, xmm0
+    ret
+}
+
+; rcx: camera, rdx: address of the frame's duration (an f32)
+;
+; process all input: ask Windows whether relevant keys are down this frame
+; and react accordingly. Movement is scaled by the frame's duration, so the
+; speed is the same at any frame rate.
+camera_process_input: proc(cam: *camera, dt: *const f32) = {
+    push rbx
+    push rsi
+    push rdi
+    push r12
+    sub rsp, 40                            ; 32 shadow; entry 8 + four pushes 32 + 40 lands on 16
+    mov rdi, rcx                           ; the camera
+    mov r12, rdx                           ; &delta_time
+    ; Nothing at all while another window has the focus, the zoom's clamp
+    ; included: a lesson may start the zoom outside the range the wheel keeps it in.
+    call GetForegroundWindow
+    cmp rax, window
+    jne done
+    lea rbx, camera_keys
+    xor esi, esi
+  keys:
+    movzx ecx, byte ptr [rbx + rsi]
+    call key_down
+    test eax, eax
+    jz next_key
+    movss xmm2, dword ptr [r12]
+    invoke(camera_process_keyboard, rdi, rsi)
+  next_key:
+    inc esi
+    cmp esi, 6
+    jb keys
+
+    ; Hold the right mouse button to look around.
+    invoke(key_down, VK_RBUTTON)
+    test eax, eax
+    jz no_look
+    movss xmm1, window_mouse_dx
+    movss xmm2, window_mouse_dy
+    invoke(camera_process_mouse, rdi)
+  no_look:
+    movss xmm1, window_scroll
+    invoke(camera_process_scroll, rdi)
+    mov window_scroll, 0
+  done:
+    add rsp, 40
+    pop r12
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+}

@@ -1,0 +1,160 @@
+; shader: a shader program from one .hlsl file, LearnOpenGL's Shader class
+;
+; The file holds `vs_main` and `ps_main`, and optionally `gs_main`. They are
+; compiled with D3DCompile, and the input layout is created against the vertex
+; shader, which is the one place D3D checks that they match. A compile error
+; prints the file, line and message, and exits.
+;
+;     invoke(shader_create, s&, "src/1.getting_started/3.1.shaders/shaders.hlsl", vertex_layout&, 2)
+;     ...
+;     invoke(shader_use, s&)
+;
+; 2.1 hello triangle does all of this by hand, once.
+
+import "../d3d11.rin"
+import "../calls.rasm"
+import "../macros.rasm"
+import "../cstr.rasm"
+import "../print.rasm"
+import "window.rasm"
+import "filesystem.rasm"
+
+shader: struct = {
+    vertex: *ID3D11VertexShader
+    geometry: *ID3D11GeometryShader        ; 0 unless the file has a gs_main
+    pixel: *ID3D11PixelShader
+    layout: *ID3D11InputLayout             ; 0 for shaders that make their own vertices
+}
+
+; shader_compile's
+shader_compile_code: *ID3DBlob = {}
+shader_compile_errors: *ID3DBlob = {}
+
+; shader_create's
+shader_create_path: *c8 = {}
+shader_create_source: *u8 = {}
+shader_create_size: u64 = 0
+shader_create_blob: *ID3DBlob = {}
+
+; rcx: path, rdx: source, r8: size, r9: entry point, [rsp + 40]: target -> rax: the compiled code
+shader_compile: proc(path: *const c8, source: *const u8, size: u64, entry: *const c8, target: *const c8) -> *ID3DBlob = {
+    push rbx
+    sub rsp, 96                            ; D3DCompile takes 11: 32 shadow + 7 * 8 = 88; entry 8 + push 8 + 96 lands on 16
+    mov rbx, rcx                           ; the path, for the messages
+    mov shader_compile_code, 0
+    mov shader_compile_errors, 0
+    ; D3DCompile wants (source, size, path): every argument moves, and rcx is
+    ; read last, after it has been overwritten. rbx holds the path instead.
+    ; The target, the fifth argument, is at [rsp + 40] on entry: + 8 + 96.
+    invoke(D3DCompile, rdx, r8, rbx, 0, D3D_COMPILE_STANDARD_FILE_INCLUDE, r9, qword ptr [rsp + 144],
+           D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_DEBUG, 0, shader_compile_code&, shader_compile_errors&)
+    test eax, eax
+    jns compiled
+    cmp shader_compile_errors, 0
+    je no_message
+    vcall(shader_compile_errors, ID3D10BlobVtbl.GetBufferPointer)
+    invoke(print, "shader: %s\n", rax)
+    invoke(ExitProcess, 1)
+  no_message:
+    invoke(print, "shader: %s\n", rbx)
+    invoke(ExitProcess, 1)
+  compiled:
+    cmp shader_compile_errors, 0
+    je done
+    release(shader_compile_errors)         ; warnings
+  done:
+    mov rax, shader_compile_code
+    add rsp, 96
+    pop rbx
+    ret
+}
+
+; rcx: shader, rdx: path relative to the repository root, r8: input layout
+; (D3D11_INPUT_ELEMENT_DESC array, or 0), r9: how many elements it has
+shader_create: proc(out: *shader, relative: *const c8, layout: *const D3D11_INPUT_ELEMENT_DESC, layout_count: u64) = {
+    push rbx
+    push rsi
+    push rdi
+    push r12
+    push r13
+    sub rsp, 48                            ; CreateInputLayout takes 6: 32 + 16; entry 8 + five pushes 40 + 48 lands on 16
+    mov rbx, rcx                           ; the shader
+    mov r12, r8                            ; the layout
+    mov r13, r9                            ; its count
+
+    invoke(filesystem_path, rdx)
+    mov shader_create_path, rax
+    invoke(filesystem_read, rax, shader_create_size&)
+    test rax, rax
+    jnz have_source
+    invoke(print, "shader: cannot read %s\n", shader_create_path)
+    invoke(ExitProcess, 1)
+  have_source:
+    mov shader_create_source, rax
+    invoke(mem_zero, rbx, sizeof(shader))
+
+    invoke(shader_compile, shader_create_path, shader_create_source, shader_create_size, "vs_main", "vs_5_0")
+    mov shader_create_blob, rax
+    vcall(shader_create_blob, ID3D10BlobVtbl.GetBufferPointer)
+    mov rsi, rax
+    vcall(shader_create_blob, ID3D10BlobVtbl.GetBufferSize)
+    mov rdi, rax
+    lea rax, [rbx].shader.vertex
+    vcall(device, ID3D11DeviceVtbl.CreateVertexShader, rsi, rdi, 0, rax)
+    test r13, r13
+    jz no_layout
+    lea rax, [rbx].shader.layout
+    vcall(device, ID3D11DeviceVtbl.CreateInputLayout, r12, r13, rsi, rdi, rax)
+    test eax, eax
+    jns no_layout
+    invoke(print, "shader: the input layout does not match vs_main in %s\n", shader_create_path)
+    invoke(ExitProcess, 1)
+  no_layout:
+    release(shader_create_blob)
+
+    invoke(cstr_find, shader_create_source, "gs_main")
+    cmp rax, -1
+    je no_geometry
+    invoke(shader_compile, shader_create_path, shader_create_source, shader_create_size, "gs_main", "gs_5_0")
+    mov shader_create_blob, rax
+    vcall(shader_create_blob, ID3D10BlobVtbl.GetBufferPointer)
+    mov rsi, rax
+    vcall(shader_create_blob, ID3D10BlobVtbl.GetBufferSize)
+    mov rdi, rax
+    lea rax, [rbx].shader.geometry
+    vcall(device, ID3D11DeviceVtbl.CreateGeometryShader, rsi, rdi, 0, rax)
+    release(shader_create_blob)
+  no_geometry:
+
+    invoke(shader_compile, shader_create_path, shader_create_source, shader_create_size, "ps_main", "ps_5_0")
+    mov shader_create_blob, rax
+    vcall(shader_create_blob, ID3D10BlobVtbl.GetBufferPointer)
+    mov rsi, rax
+    vcall(shader_create_blob, ID3D10BlobVtbl.GetBufferSize)
+    mov rdi, rax
+    lea rax, [rbx].shader.pixel
+    vcall(device, ID3D11DeviceVtbl.CreatePixelShader, rsi, rdi, 0, rax)
+    release(shader_create_blob)
+
+    add rsp, 48
+    pop r13
+    pop r12
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+}
+
+; rcx: shader. Binds its stages and input layout.
+shader_use: proc(s: *const shader) = {
+    push rbx
+    sub rsp, 32                            ; 32 shadow; entry 8 + push 8 + 32 lands on 16
+    mov rbx, rcx
+    vcall(context, ID3D11DeviceContextVtbl.IASetInputLayout, [rbx].shader.layout)
+    vcall(context, ID3D11DeviceContextVtbl.VSSetShader, [rbx].shader.vertex, 0, 0)
+    vcall(context, ID3D11DeviceContextVtbl.GSSetShader, [rbx].shader.geometry, 0, 0)
+    vcall(context, ID3D11DeviceContextVtbl.PSSetShader, [rbx].shader.pixel, 0, 0)
+    add rsp, 32
+    pop rbx
+    ret
+}

@@ -1,0 +1,147 @@
+; 1. Advanced lighting: Blinn-Phong
+;
+; Phong's highlight compares the eye direction with the light's reflection.
+; When they are more than 90 degrees apart the dot product goes negative, is
+; clamped to zero, and the highlight is cut off with a hard edge. That shows
+; most on rough surfaces, whose highlights are wide: here a wooden floor, seen
+; low, from the light's own height.
+;
+; Blinn's fix compares the normal with the halfway vector, the direction
+; between "to the light" and "to the eye". The angle between those never
+; passes 90 degrees for a visible surface, so the highlight fades out
+; smoothly. It needs a higher exponent for the same size of highlight.
+;
+;   Tab   Blinn-Phong / Phong
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/cube.rasm"
+import "../../../includes/learn/camera.rasm"
+import "../../../includes/learn/transforms.rasm"
+
+; A wide wooden floor at y = -0.5, the texture repeated ten times across.
+plane_vertices: [48]const f32 = {            ; 6 vertices of 8 floats
+    ; position             normal             uv
+    -10.0, -0.5,  10.0,   0.0, 1.0, 0.0,    0.0, 10.0,
+     10.0, -0.5,  10.0,   0.0, 1.0, 0.0,   10.0, 10.0,
+     10.0, -0.5, -10.0,   0.0, 1.0, 0.0,   10.0,  0.0,
+    -10.0, -0.5,  10.0,   0.0, 1.0, 0.0,    0.0, 10.0,
+     10.0, -0.5, -10.0,   0.0, 1.0, 0.0,   10.0,  0.0,
+    -10.0, -0.5, -10.0,   0.0, 1.0, 0.0,    0.0,  0.0,
+}
+
+; Mirrors `cbuffer light` in advanced_lighting.hlsl.
+light_constants: struct = {
+    position: vec3
+    blinn: u32
+}
+
+camera_start: const vec3 = { 0.0, 0.0, 3.0 }
+clear_color: [4]const f32 = { 0.0, 0.0, 0.0, 1.0 }
+lamp_color: const vec4 = { 1.0, 1.0, 1.0, 1.0 }
+
+t: transforms = {}
+light: light_constants = { .position = { 0.0, 0.0, 0.0 }, .blinn = 1 }
+model: mat4 = {}
+s: shader = {}
+lamp_shader: shader = {}
+cam: camera = {}
+cube_vb: *ID3D11Buffer = {}
+plane_vb: *ID3D11Buffer = {}
+transforms_buffer: *ID3D11Buffer = {}
+light_buffer: *ID3D11Buffer = {}
+lamp_buffer: *ID3D11Buffer = {}
+wood: *ID3D11ShaderResourceView = {}
+sampler: *ID3D11SamplerState = {}
+
+; timing
+delta_time: f32 = 0.0
+last_frame: f32 = 0.0
+
+main: proc() -> i32 = {
+    sub rsp, 40                            ; draw_vertices takes 5: 32 + 8; entry 8 + 40 lands on 16
+
+    invoke(window_create, "LearnD3D11  (Tab: blinn-phong / phong)")
+    call window_create_depth
+
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP)
+    mov sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 0, 1, sampler&)
+
+    ; build and compile shaders
+    ; -------------------------
+    invoke(shader_create, s&, "src/5.advanced_lighting/1.advanced_lighting/advanced_lighting.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+    invoke(shader_create, lamp_shader&, "src/5.advanced_lighting/1.advanced_lighting/light_cube.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+
+    ; set up vertex data and textures
+    ; -------------------------------
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, cube_vertices&, sizeof(cube_vertices))
+    mov cube_vb, rax
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, plane_vertices&, sizeof(plane_vertices))
+    mov plane_vb, rax
+    invoke(create_constant_buffer, sizeof(transforms))
+    mov transforms_buffer, rax
+    invoke(create_constant_buffer, sizeof(light_constants))
+    mov light_buffer, rax
+    invoke(create_constant_buffer, sizeof(vec4))
+    mov lamp_buffer, rax
+    invoke(filesystem_path, "resources/textures/wood.png")
+    invoke(load_texture, rax, 0)
+    mov wood, rax
+
+    lea rcx, cam
+    lea rdx, camera_start
+    movss xmm2, -90.0                      ; yaw
+    xorps xmm3, xmm3                       ; pitch 0
+    call camera_create
+
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    call get_time
+    movss xmm1, xmm0
+    subss xmm0, last_frame
+    movss delta_time, xmm0
+    movss last_frame, xmm1
+
+    invoke(camera_process_input, cam&, delta_time&)
+    ; mode 0 is Blinn-Phong, mode 1 plain Phong
+    invoke(window_mode, 2)
+    mov ecx, 1
+    sub ecx, eax
+    mov light.blinn, ecx
+
+    invoke(window_begin, clear_color&)
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    invoke(bind_constants, 0, transforms_buffer)
+    invoke(transforms_from_camera, t&, cam&)
+
+    ; the floor, lit from the origin
+    invoke(update_buffer, light_buffer, light&, sizeof(light_constants))
+    invoke(shader_use, s&)
+    invoke(bind_constants, 1, light_buffer)
+    invoke(bind_texture, 0, wood)
+    invoke(m4_identity, model&)
+    invoke(draw_vertices, transforms_buffer, t&, plane_vb, 6, model&)
+
+    ; the lamp, a tiny cube where the light is
+    invoke(update_buffer, lamp_buffer, lamp_color&, sizeof(vec4))
+    invoke(shader_use, lamp_shader&)
+    invoke(bind_constants, 1, lamp_buffer)
+    lea rcx, model
+    lea rdx, light.position
+    movss xmm2, 0.1
+    call m4_translate_scale
+    invoke(draw_vertices, transforms_buffer, t&, cube_vb, 36, model&)
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

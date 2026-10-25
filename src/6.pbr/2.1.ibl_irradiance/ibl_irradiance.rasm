@@ -1,0 +1,252 @@
+; 2.1 IBL: diffuse irradiance
+;
+; Real objects are lit by everything around them, not by four points. Image
+; based lighting takes "everything around" from an HDR photograph of a real
+; place, and lets every pixel be lit by all of it.
+;
+; For diffuse light that means: for each normal, the cosine-weighted average
+; of the whole hemisphere it faces. That is far too much to sum per pixel per
+; frame, but it depends only on the normal, so it is computed once at startup
+; into a small cubemap, the irradiance map, and looked up by normal:
+;
+;   1. the photo, stored equirectangular (a world map of directions), is drawn
+;      onto the six faces of a cubemap
+;   2. that cubemap is convolved into a 32x32 irradiance cubemap
+;
+; The spheres keep the four point lights of 1.1 and add the environment as
+; their ambient term; the photo itself is drawn behind them. (LearnOpenGL's
+; 2.1.1 conversion step is the first half of this program.)
+;
+; Both steps are render_to_cube (includes/learn/pbr.rasm): the unit cube drawn
+; once per face of the target, through a 90-degree view out of that face, with
+; the step's shader.
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/cube.rasm"
+import "../../../includes/learn/camera.rasm"
+import "../../../includes/learn/transforms.rasm"
+import "../../../includes/learn/pbr.rasm"
+
+; Mirror `cbuffer material` and `cbuffer lights` in pbr.hlsl.
+material_constants: struct = {
+    albedo: vec3
+    metallic: f32
+    roughness: f32
+    ao: f32
+    textured: u32
+    pad: f32
+}
+
+lights_constants: struct = {
+    positions: [4]vec4
+    colors: [4]vec4
+}
+
+camera_start: const vec3 = { 0.0, 0.0, 22.0 }
+clear_color: [4]const f32 = { 0.1, 0.1, 0.1, 1.0 }
+
+t: transforms = {}
+; The lights stand still here, so the whole buffer is the initialiser, sent
+; once (masm64-dx11 copied it together at startup).
+lights: lights_constants = {
+    .positions = {
+        { -10.0,  10.0, 10.0, 0.0 },
+        {  10.0,  10.0, 10.0, 0.0 },
+        { -10.0, -10.0, 10.0, 0.0 },
+        {  10.0, -10.0, 10.0, 0.0 },
+    },
+    .colors = {
+        { 300.0, 300.0, 300.0, 0.0 },
+        { 300.0, 300.0, 300.0, 0.0 },
+        { 300.0, 300.0, 300.0, 0.0 },
+        { 300.0, 300.0, 300.0, 0.0 },
+    },
+}
+material: material_constants = { .albedo = { 0.5, 0.0, 0.0 }, .ao = 1.0 }
+model_matrix: mat4 = {}
+sphere_position: vec3 = {}                 ; z stays 0
+pbr_shader: shader = {}
+equirect_shader: shader = {}
+irradiance_shader: shader = {}
+background_shader: shader = {}
+cam: camera = {}
+ball: sphere = {}
+env_cubemap: cube_target = {}
+irradiance_map: cube_target = {}
+cube_vb: *ID3D11Buffer = {}
+transforms_buffer: *ID3D11Buffer = {}
+material_buffer: *ID3D11Buffer = {}
+lights_buffer: *ID3D11Buffer = {}
+wrap_sampler: *ID3D11SamplerState = {}
+clamp_sampler: *ID3D11SamplerState = {}
+hdr_texture: *ID3D11ShaderResourceView = {}
+
+; The sky is drawn last, at the far plane: it passes where nothing else was
+; drawn, and leaves the depth buffer alone.
+sky_depth_desc: D3D11_DEPTH_STENCIL_DESC = {
+    .DepthEnable = 1,
+    .DepthWriteMask = D3D11_DEPTH_WRITE_MASK.D3D11_DEPTH_WRITE_MASK_ZERO,
+    .DepthFunc = D3D11_COMPARISON_FUNC.D3D11_COMPARISON_LESS_EQUAL,
+}
+sky_depth: *ID3D11DepthStencilState = {}
+
+; timing
+delta_time: f32 = 0.0
+last_frame: f32 = 0.0
+
+main: proc() -> i32 = {
+    push rbx
+    push rsi
+    sub rsp, 40                            ; draw_vertices takes 5: 32 + 8; entry 8 + two pushes 16 + 40 lands on 16
+
+    invoke(window_create, "LearnD3D11")
+    call window_create_depth
+    call window_use_srgb
+
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP)
+    mov wrap_sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 0, 1, wrap_sampler&)
+
+    ; build and compile shaders
+    ; -------------------------
+    invoke(shader_create, pbr_shader&, "src/6.pbr/2.1.ibl_irradiance/pbr.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+    invoke(shader_create, equirect_shader&, "src/6.pbr/2.1.ibl_irradiance/equirectangular_to_cubemap.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+    invoke(shader_create, irradiance_shader&, "src/6.pbr/2.1.ibl_irradiance/irradiance_convolution.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+    invoke(shader_create, background_shader&, "src/6.pbr/2.1.ibl_irradiance/background.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+
+    ; pbr: the samplers the precomputation passes and the spheres share
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_CLAMP)
+    mov clamp_sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 1, 1, clamp_sampler&)
+    vcall(device, ID3D11DeviceVtbl.CreateDepthStencilState, sky_depth_desc&, sky_depth&)
+
+    ; set up vertex data
+    ; ------------------
+    invoke(create_sphere, ball&, 64)
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, cube_vertices&, sizeof(cube_vertices))
+    mov cube_vb, rax
+    invoke(create_constant_buffer, sizeof(transforms))
+    mov transforms_buffer, rax
+    invoke(create_constant_buffer, sizeof(material_constants))
+    mov material_buffer, rax
+    invoke(create_constant_buffer, sizeof(lights_constants))
+    mov lights_buffer, rax
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    invoke(bind_constants, 0, transforms_buffer)
+
+    ; pbr: load the HDR environment map
+    ; ---------------------------------
+    invoke(filesystem_path, "resources/textures/hdr/newport_loft.hdr")
+    invoke(load_hdr, rax)
+    mov hdr_texture, rax
+
+    ; pbr: convert the equirectangular map to a cubemap, with mipmaps (the
+    ; prefilter reads them to avoid sparkle from small, very bright spots)
+    ; ----------------------------------------------------------------------
+    invoke(create_cube_target, env_cubemap&, 512, 0, 1)
+    invoke(shader_use, equirect_shader&)
+    invoke(bind_texture, 0, hdr_texture)
+    invoke(render_to_cube, env_cubemap&, 0, transforms_buffer, cube_vb)
+    call unbind_textures
+    vcall(context, ID3D11DeviceContextVtbl.GenerateMips, env_cubemap.srv)
+
+    ; pbr: an irradiance cubemap, by convolving the environment
+    ; ---------------------------------------------------------
+    invoke(create_cube_target, irradiance_map&, 32, 1, 0)
+    invoke(shader_use, irradiance_shader&)
+    invoke(bind_texture, 0, env_cubemap.srv)
+    invoke(render_to_cube, irradiance_map&, 0, transforms_buffer, cube_vb)
+    call unbind_textures
+
+    ; lights
+    ; ------
+    invoke(update_buffer, lights_buffer, lights&, sizeof(lights_constants))
+
+    lea rcx, cam
+    lea rdx, camera_start
+    movss xmm2, -90.0                      ; yaw
+    movss xmm3, 0.0                        ; pitch
+    call camera_create
+
+    ; render loop
+    ; -----------
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    ; per-frame time logic
+    call get_time
+    movss xmm1, xmm0
+    subss xmm0, last_frame
+    movss delta_time, xmm0
+    movss last_frame, xmm1
+
+    ; input
+    invoke(camera_process_input, cam&, delta_time&)
+
+    ; render
+    invoke(window_begin, clear_color&)
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    invoke(bind_constants, 0, transforms_buffer)
+    invoke(transforms_from_camera, t&, cam&)
+    invoke(shader_use, pbr_shader&)
+    invoke(bind_constants, 1, material_buffer)
+    invoke(bind_constants, 2, lights_buffer)
+    invoke(bind_texture, 0, irradiance_map.srv)
+
+    ; render rows*column number of spheres with varying metallic/roughness
+    ; values: metallic from bottom to top, roughness from left to right
+    xor ebx, ebx                           ; row
+  grid_rows:
+    xor esi, esi                           ; column
+  grid_columns:
+    cvtsi2ss xmm0, ebx
+    divss xmm0, 6.0
+    movss material.metallic, xmm0
+    ; perfectly smooth reflects one point of light, which looks wrong for a
+    ; point light: start just above zero
+    cvtsi2ss xmm0, esi
+    divss xmm0, 6.0
+    movss xmm1, 0.05                       ; clampf(x, lo, hi): xmm0, xmm1, xmm2
+    movss xmm2, math_one
+    call clampf
+    movss material.roughness, xmm0
+    invoke(update_buffer, material_buffer, material&, sizeof(material_constants))
+    ; at ((column - 3) * 2.5, (row - 3) * 2.5, 0)
+    movss xmm1, 2.5
+    lea eax, [esi - 3]
+    cvtsi2ss xmm0, eax
+    mulss xmm0, xmm1
+    movss sphere_position.x, xmm0
+    lea eax, [ebx - 3]
+    cvtsi2ss xmm0, eax
+    mulss xmm0, xmm1
+    movss sphere_position.y, xmm0
+    invoke(m4_translate, model_matrix&, sphere_position&)
+    invoke(draw_sphere, transforms_buffer, t&, ball&, model_matrix&)
+    inc esi
+    cmp esi, 7
+    jb grid_columns
+    inc ebx
+    cmp ebx, 7
+    jb grid_rows
+
+    ; render skybox (render as last to prevent overdraw)
+    invoke(shader_use, background_shader&)
+    invoke(bind_texture, 0, env_cubemap.srv)
+    vcall(context, ID3D11DeviceContextVtbl.OMSetDepthStencilState, sky_depth, 0)
+    invoke(m4_identity, model_matrix&)
+    invoke(draw_vertices, transforms_buffer, t&, cube_vb, 36, model_matrix&)
+    vcall(context, ID3D11DeviceContextVtbl.OMSetDepthStencilState, 0, 0)
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

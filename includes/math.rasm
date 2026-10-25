@@ -1,0 +1,877 @@
+; math: vectors and 4x4 matrices, what glm is to LearnOpenGL
+;
+; Conventions, chosen to match the maths in LearnOpenGL so its formulas carry
+; over unchanged:
+;
+;   * right-handed world: +x right, +y up, the camera looks down -z
+;   * column vectors: a point is transformed as `M * p`, so `T * R * S`
+;     scales first and translates last
+;   * clip-space depth runs 0..1, which is D3D's range (GL's is -1..1)
+;
+; A mat4 is stored row by row, `m[row * 4 + col]`. Every shader starts with
+; `#pragma pack_matrix(row_major)`, which makes HLSL read the constant buffer
+; the same way, so `mul(M, v)` in a shader is exactly `M * v` here.
+;
+; Calling convention: Win64, floats included. A float argument goes in the
+; xmm register of its position (the second argument in xmm1, whatever the
+; first one was), from the fifth on in the stack slots [rsp + 32],
+; [rsp + 40], ... of the caller. A float result comes back in xmm0. Vectors
+; and matrices are passed by address, and results are written through `out`,
+; which may be the same as an input.
+;
+; Only xmm0-xmm5 are used: xmm6-xmm15 belong to the caller.
+;
+; A private convention, stated because nothing checks it: radians, sinf, cosf,
+; tanf and m4_identity touch xmm0 (and m4_identity eax) and nothing else, and
+; the procs here that call them keep values in other registers across those
+; calls. Win64 would not allow that for a function this file did not write.
+
+vec2: struct = {
+    x: f32
+    y: f32
+}
+
+vec3: struct = {
+    x: f32
+    y: f32
+    z: f32
+}
+
+vec4: struct = {
+    x: f32
+    y: f32
+    z: f32
+    w: f32
+}
+
+mat4: struct = {
+    m: [16]f32
+}
+
+; `align(16)` is not optional: andps and xorps with a memory operand fault on
+; an address that is not 16-aligned. The type is 16 bytes, so the operand is
+; an xmmword without saying so.
+math_sign_mask: [4]const u32[align(16)] = { 0x80000000, 0x80000000, 0x80000000, 0x80000000 }    ; xor: flips every lane's sign
+math_abs_mask: [4]const u32[align(16)] = { 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF }     ; and: clears it
+
+; Named constants, as math.asm had them. A literal does the same job
+; (`mulss xmm0, 0.5` reads a pooled constant); these are kept for the
+; lessons that name them.
+math_one: const f32 = 1.0
+math_half: const f32 = 0.5
+math_pi: const f32 = 3.14159265358979
+math_degrees_to_radians: const f32 = 0.0174532925199433
+
+; xmm = vec3 at [base], in lanes x, y, z (w is 0). base is a register: a
+; macro cannot add 8 to an operand, so a global goes through lea first, or
+; through v3load_var.
+v3load: macro(reg, base) = {
+    movsd reg, qword ptr [base]
+    insertps reg, dword ptr [base + 8], 0x20
+}
+
+; vec3 at [base] = lanes x, y, z of xmm
+v3store: macro(base, reg) = {
+    movsd qword ptr [base], reg
+    extractps dword ptr [base + 8], reg, 2
+}
+
+; xmm = a vec3 global. `var.z` is an ordinary field operand once var is
+; substituted.
+v3load_var: macro(reg, var) = {
+    movsd reg, qword ptr var
+    insertps reg, var.z, 0x20
+}
+
+; a vec3 global = lanes x, y, z of xmm
+v3store_var: macro(var, reg) = {
+    movsd qword ptr var, reg
+    extractps var.z, reg, 2
+}
+
+; xmm = the same float in every lane
+splat: macro(reg) = {
+    shufps reg, reg, 0
+}
+
+; mat4 at [dst] = mat4 at [src], through xmm0
+m4_copy: macro(dst, src) = {
+    movups xmm0, xmmword ptr [src]
+    movups xmmword ptr [dst], xmm0
+    movups xmm0, xmmword ptr [src + 16]
+    movups xmmword ptr [dst + 16], xmm0
+    movups xmm0, xmmword ptr [src + 32]
+    movups xmmword ptr [dst + 32], xmm0
+    movups xmm0, xmmword ptr [src + 48]
+    movups xmmword ptr [dst + 48], xmm0
+}
+
+; scalars ----------------------------------------------------------------------
+
+; xmm0: degrees -> xmm0: radians
+radians: proc(degrees: f32) -> f32 = {
+    mulss xmm0, math_degrees_to_radians
+    ret
+}
+
+; The x87 unit still has sine, cosine and tangent instructions, which saves
+; writing polynomials. It only loads from memory, so the float goes through
+; a slot: on entry, the 32 bytes above the return address are the shadow
+; space the caller reserved for this call, and [rsp + 8] is rcx's home,
+; unused because the argument came in xmm0. No frame, no global.
+;
+; xmm0: angle in radians -> xmm0
+sinf: proc(x: f32) -> f32 = {
+    movss dword ptr [rsp + 8], xmm0
+    fld dword ptr [rsp + 8]
+    fsin
+    fstp dword ptr [rsp + 8]
+    movss xmm0, dword ptr [rsp + 8]
+    ret
+}
+
+cosf: proc(x: f32) -> f32 = {
+    movss dword ptr [rsp + 8], xmm0
+    fld dword ptr [rsp + 8]
+    fcos
+    fstp dword ptr [rsp + 8]
+    movss xmm0, dword ptr [rsp + 8]
+    ret
+}
+
+tanf: proc(x: f32) -> f32 = {
+    movss dword ptr [rsp + 8], xmm0
+    fld dword ptr [rsp + 8]
+    fptan                                  ; leaves tan(x), then 1.0 on top
+    fstp st(0)
+    fstp dword ptr [rsp + 8]
+    movss xmm0, dword ptr [rsp + 8]
+    ret
+}
+
+; xmm0: x, xmm1: y -> xmm0: x to the power y, for x > 0. 2^(y * log2 x), with
+; x87's log2 and 2^x.
+powf: proc(x: f32, y: f32) -> f32 = {
+    xorps xmm2, xmm2
+    comiss xmm0, xmm2
+    ja positive
+    xorps xmm0, xmm0
+    ret
+  positive:
+    movss dword ptr [rsp + 8], xmm1
+    fld dword ptr [rsp + 8]                ; y
+    movss dword ptr [rsp + 8], xmm0
+    fld dword ptr [rsp + 8]                ; x, y
+    fyl2x                                  ; y * log2(x)
+    fld st(0)
+    frndint                                ; whole part
+    fsub st(1), st(0)                      ; whole, fraction
+    fxch st(1)                             ; fraction, whole
+    f2xm1                                  ; 2^fraction - 1
+    fld1
+    faddp st(1), st(0)                     ; 2^fraction, whole
+    fscale                                 ; 2^fraction * 2^whole
+    fstp st(1)
+    fstp dword ptr [rsp + 8]
+    movss xmm0, dword ptr [rsp + 8]
+    ret
+}
+
+; rand and srand exactly as the C runtime has them, so a lesson seeded the
+; same way places its random things where LearnOpenGL's and rin's versions do.
+math_rand_state: u32 = 1
+
+; ecx: seed
+srand: proc(seed: u32) = {
+    mov math_rand_state, ecx
+    ret
+}
+
+; -> eax: 0..32767
+rand: proc() -> i32 = {
+    imul eax, math_rand_state, 214013
+    add eax, 2531011
+    mov math_rand_state, eax
+    shr eax, 16
+    and eax, 0x7FFF
+    ret
+}
+
+; xmm0: x, xmm1: lo, xmm2: hi -> xmm0
+clampf: proc(x: f32, lo: f32, hi: f32) -> f32 = {
+    maxss xmm0, xmm1
+    minss xmm0, xmm2
+    ret
+}
+
+; vec3 -------------------------------------------------------------------------
+
+; rcx: out, rdx: a, r8: b
+v3_add: proc(out: *vec3, a: *const vec3, b: *const vec3) = {
+    v3load(xmm0, rdx)
+    v3load(xmm1, r8)
+    addps xmm0, xmm1
+    v3store(rcx, xmm0)
+    ret
+}
+
+v3_sub: proc(out: *vec3, a: *const vec3, b: *const vec3) = {
+    v3load(xmm0, rdx)
+    v3load(xmm1, r8)
+    subps xmm0, xmm1
+    v3store(rcx, xmm0)
+    ret
+}
+
+v3_mul: proc(out: *vec3, a: *const vec3, b: *const vec3) = {
+    v3load(xmm0, rdx)
+    v3load(xmm1, r8)
+    mulps xmm0, xmm1
+    v3store(rcx, xmm0)
+    ret
+}
+
+; rcx: out, rdx: a, xmm2: s
+v3_scale: proc(out: *vec3, a: *const vec3, s: f32) = {
+    v3load(xmm0, rdx)
+    splat(xmm2)
+    mulps xmm0, xmm2
+    v3store(rcx, xmm0)
+    ret
+}
+
+; rcx: a, rdx: b -> xmm0: a . b
+v3_dot: proc(a: *const vec3, b: *const vec3) -> f32 = {
+    v3load(xmm0, rcx)
+    v3load(xmm1, rdx)
+    dpps xmm0, xmm1, 0x71                  ; multiply x, y, z; sum into lane 0
+    ret
+}
+
+; rcx: out, rdx: a, r8: b. (a.y b.z - a.z b.y, a.z b.x - a.x b.z, a.x b.y - a.y b.x)
+v3_cross: proc(out: *vec3, a: *const vec3, b: *const vec3) = {
+    v3load(xmm0, rdx)
+    v3load(xmm1, r8)
+    movaps xmm2, xmm0
+    movaps xmm3, xmm1
+    shufps xmm0, xmm0, 0xC9                ; a.yzx
+    shufps xmm1, xmm1, 0xD2                ; b.zxy
+    mulps xmm0, xmm1
+    shufps xmm2, xmm2, 0xD2                ; a.zxy
+    shufps xmm3, xmm3, 0xC9                ; b.yzx
+    mulps xmm2, xmm3
+    subps xmm0, xmm2
+    v3store(rcx, xmm0)
+    ret
+}
+
+; rcx: a -> xmm0: |a|
+v3_length: proc(a: *const vec3) -> f32 = {
+    v3load(xmm0, rcx)
+    dpps xmm0, xmm0, 0x71
+    sqrtss xmm0, xmm0
+    ret
+}
+
+; rcx: out, rdx: a. A zero vector stays zero.
+v3_normalize: proc(out: *vec3, a: *const vec3) = {
+    v3load(xmm0, rdx)
+    movaps xmm1, xmm0
+    dpps xmm1, xmm1, 0x7F                  ; |a|^2 in every lane
+    xorps xmm2, xmm2
+    comiss xmm1, xmm2
+    je done
+    sqrtps xmm1, xmm1
+    divps xmm0, xmm1
+  done:
+    v3store(rcx, xmm0)
+    ret
+}
+
+; rcx: out, rdx: a, r8: b, xmm3: t -> a + (b - a) t
+v3_lerp: proc(out: *vec3, a: *const vec3, b: *const vec3, t: f32) = {
+    v3load(xmm0, rdx)
+    v3load(xmm1, r8)
+    subps xmm1, xmm0
+    splat(xmm3)
+    mulps xmm1, xmm3
+    addps xmm0, xmm1
+    v3store(rcx, xmm0)
+    ret
+}
+
+; rcx: out, xmm1: x, xmm2: y, xmm3: z
+v3_set: proc(out: *vec3, x: f32, y: f32, z: f32) = {
+    movss [rcx].vec3.x, xmm1
+    movss [rcx].vec3.y, xmm2
+    movss [rcx].vec3.z, xmm3
+    ret
+}
+
+; mat4 -------------------------------------------------------------------------
+
+; rcx: out. Touches xmm0 and eax only.
+m4_identity: proc(out: *mat4) = {
+    xorps xmm0, xmm0
+    movups xmmword ptr [rcx], xmm0
+    movups xmmword ptr [rcx + 16], xmm0
+    movups xmmword ptr [rcx + 32], xmm0
+    movups xmmword ptr [rcx + 48], xmm0
+    ; 1.0 as an immediate is its bits. `mov eax, 1.0` would also assemble, but
+    ; as a load from the constant pool: a float literal is memory.
+    mov eax, 0x3F800000                    ; 1.0
+    mov [rcx].mat4.m[0], eax
+    mov [rcx].mat4.m[5], eax
+    mov [rcx].mat4.m[10], eax
+    mov [rcx].mat4.m[15], eax
+    ret
+}
+
+; One row of out = a * b: a[row][0] * b.row0 + ... + a[row][3] * b.row3, with
+; b's rows already in xmm2-xmm5. math.asm's `for row, <0, 16, 32, 48>`: rasm's
+; macros cannot loop, so m4_mul invokes this four times. `row * 4 + 1` folds
+; to a number once `row` is substituted.
+m4_mul_row: macro(row) = {
+    movss xmm0, [rdx].mat4.m[row * 4]
+    splat(xmm0)
+    mulps xmm0, xmm2
+    movss xmm1, [rdx].mat4.m[row * 4 + 1]
+    splat(xmm1)
+    mulps xmm1, xmm3
+    addps xmm0, xmm1
+    movss xmm1, [rdx].mat4.m[row * 4 + 2]
+    splat(xmm1)
+    mulps xmm1, xmm4
+    addps xmm0, xmm1
+    movss xmm1, [rdx].mat4.m[row * 4 + 3]
+    splat(xmm1)
+    mulps xmm1, xmm5
+    addps xmm0, xmm1
+    ; the field is an f32, the store is sixteen bytes: the explicit size says so
+    movups xmmword ptr [rcx + row * 16], xmm0
+}
+
+; rcx: out, rdx: a, r8: b -> out = a * b
+;
+; b is read into registers first and each row of a is read before its row of
+; out is written, so out may be a or b.
+m4_mul: proc(out: *mat4, a: *const mat4, b: *const mat4) = {
+    movups xmm2, xmmword ptr [r8]
+    movups xmm3, xmmword ptr [r8 + 16]
+    movups xmm4, xmmword ptr [r8 + 32]
+    movups xmm5, xmmword ptr [r8 + 48]
+    m4_mul_row(0)
+    m4_mul_row(1)
+    m4_mul_row(2)
+    m4_mul_row(3)
+    ret
+}
+
+; rcx: out (vec4), rdx: m, r8: v (vec4) -> out = m * v
+m4_mul_v4: proc(out: *vec4, m: *const mat4, v: *const vec4) = {
+    movups xmm4, xmmword ptr [r8]
+    movups xmm0, xmmword ptr [rdx]
+    mulps xmm0, xmm4
+    movups xmm1, xmmword ptr [rdx + 16]
+    mulps xmm1, xmm4
+    movups xmm2, xmmword ptr [rdx + 32]
+    mulps xmm2, xmm4
+    movups xmm3, xmmword ptr [rdx + 48]
+    mulps xmm3, xmm4
+    haddps xmm0, xmm1                      ; row sums, two lanes at a time
+    haddps xmm2, xmm3
+    haddps xmm0, xmm2
+    movups xmmword ptr [rcx], xmm0
+    ret
+}
+
+; rcx: out, rdx: a -> out = a transposed
+m4_transpose: proc(out: *mat4, a: *const mat4) = {
+    movups xmm0, xmmword ptr [rdx]
+    movups xmm1, xmmword ptr [rdx + 16]
+    movups xmm2, xmmword ptr [rdx + 32]
+    movups xmm3, xmmword ptr [rdx + 48]
+    movaps xmm4, xmm0
+    movaps xmm5, xmm2
+    unpcklps xmm0, xmm1                    ; a00 a10 a01 a11
+    unpckhps xmm4, xmm1                    ; a02 a12 a03 a13
+    unpcklps xmm2, xmm3                    ; a20 a30 a21 a31
+    unpckhps xmm5, xmm3                    ; a22 a32 a23 a33
+    movaps xmm1, xmm0
+    movlhps xmm0, xmm2                     ; a00 a10 a20 a30
+    movhlps xmm2, xmm1                     ; a01 a11 a21 a31
+    movaps xmm3, xmm4
+    movlhps xmm4, xmm5                     ; a02 a12 a22 a32
+    movhlps xmm5, xmm3                     ; a03 a13 a23 a33
+    movups xmmword ptr [rcx], xmm0
+    movups xmmword ptr [rcx + 16], xmm2
+    movups xmmword ptr [rcx + 32], xmm4
+    movups xmmword ptr [rcx + 48], xmm5
+    ret
+}
+
+; rcx: out, rdx: t (vec3) -> a translation by t
+;
+; `call m4_identity` with rsp 8 off alignment and no shadow space: legal
+; here, because the callee is a leaf of this file that touches neither the
+; stack nor any aligned memory. The same holds for every call to it below.
+m4_translate: proc(out: *mat4, t: *const vec3) = {
+    mov r8, rdx
+    call m4_identity
+    mov eax, [r8].vec3.x
+    mov [rcx].mat4.m[3], eax
+    mov eax, [r8].vec3.y
+    mov [rcx].mat4.m[7], eax
+    mov eax, [r8].vec3.z
+    mov [rcx].mat4.m[11], eax
+    ret
+}
+
+; rcx: out, rdx: s (vec3) -> a scale by s
+m4_scale: proc(out: *mat4, s: *const vec3) = {
+    mov r8, rdx
+    call m4_identity
+    mov eax, [r8].vec3.x
+    mov [rcx].mat4.m[0], eax
+    mov eax, [r8].vec3.y
+    mov [rcx].mat4.m[5], eax
+    mov eax, [r8].vec3.z
+    mov [rcx].mat4.m[10], eax
+    ret
+}
+
+; rcx: out, rdx: t (vec3), xmm2: s -> translate(t) * scale(s, s, s): an object
+; of size s at t, such as the small cube that stands in for a light
+m4_translate_scale: proc(out: *mat4, t: *const vec3, s: f32) = {
+    mov r8, rdx
+    call m4_identity
+    movss [rcx].mat4.m[0], xmm2
+    movss [rcx].mat4.m[5], xmm2
+    movss [rcx].mat4.m[10], xmm2
+    mov eax, [r8].vec3.x
+    mov [rcx].mat4.m[3], eax
+    mov eax, [r8].vec3.y
+    mov [rcx].mat4.m[7], eax
+    mov eax, [r8].vec3.z
+    mov [rcx].mat4.m[11], eax
+    ret
+}
+
+rotate_axis: vec3 = {}                     ; m4_rotate's normalised axis
+
+; rcx: out, xmm1: angle in radians, r8: axis (vec3)
+;
+; A rotation of `angle` about `axis`, counter-clockwise when looking down the
+; axis towards the origin.
+;
+; math.asm had `local a:vec3, c:real4, s:real4, t:real4` and a generated
+; frame. Here out and angle are kept in this call's own shadow space,
+; [rsp + 48] and [rsp + 56] once the 40 bytes are subtracted (rcx's home and
+; the second argument's, which is the angle's slot although it arrived in
+; xmm1); the normalised axis is a global, so its fields are named operands;
+; and c, s and t stay in xmm4, xmm3 and xmm5 across sinf, cosf and
+; m4_identity, which touch only xmm0 (and eax).
+m4_rotate: proc(out: *mat4, angle: f32, axis: *const vec3) = {
+    sub rsp, 40                            ; 32 shadow for our calls, and rsp back on 16
+    mov [rsp + 48], rcx                    ; out
+    movss dword ptr [rsp + 56], xmm1       ; angle
+    lea rcx, rotate_axis
+    mov rdx, r8
+    call v3_normalize
+    movss xmm0, dword ptr [rsp + 56]
+    call cosf
+    movaps xmm4, xmm0                      ; c
+    movss xmm5, 1.0
+    subss xmm5, xmm0                       ; t = 1 - c
+    movss xmm0, dword ptr [rsp + 56]
+    call sinf
+    movaps xmm3, xmm0                      ; s
+    mov rcx, [rsp + 48]
+    call m4_identity
+    ; r.m[0] = c + a.x * a.x * t
+    movss xmm0, rotate_axis.x
+    mulss xmm0, rotate_axis.x
+    mulss xmm0, xmm5
+    addss xmm0, xmm4
+    movss [rcx].mat4.m[0], xmm0
+    ; r.m[1] = a.x * a.y * t - a.z * s
+    movss xmm0, rotate_axis.x
+    mulss xmm0, rotate_axis.y
+    mulss xmm0, xmm5
+    movss xmm1, rotate_axis.z
+    mulss xmm1, xmm3
+    subss xmm0, xmm1
+    movss [rcx].mat4.m[1], xmm0
+    ; r.m[2] = a.x * a.z * t + a.y * s
+    movss xmm0, rotate_axis.x
+    mulss xmm0, rotate_axis.z
+    mulss xmm0, xmm5
+    movss xmm1, rotate_axis.y
+    mulss xmm1, xmm3
+    addss xmm0, xmm1
+    movss [rcx].mat4.m[2], xmm0
+    ; r.m[4] = a.y * a.x * t + a.z * s
+    movss xmm0, rotate_axis.y
+    mulss xmm0, rotate_axis.x
+    mulss xmm0, xmm5
+    movss xmm1, rotate_axis.z
+    mulss xmm1, xmm3
+    addss xmm0, xmm1
+    movss [rcx].mat4.m[4], xmm0
+    ; r.m[5] = c + a.y * a.y * t
+    movss xmm0, rotate_axis.y
+    mulss xmm0, rotate_axis.y
+    mulss xmm0, xmm5
+    addss xmm0, xmm4
+    movss [rcx].mat4.m[5], xmm0
+    ; r.m[6] = a.y * a.z * t - a.x * s
+    movss xmm0, rotate_axis.y
+    mulss xmm0, rotate_axis.z
+    mulss xmm0, xmm5
+    movss xmm1, rotate_axis.x
+    mulss xmm1, xmm3
+    subss xmm0, xmm1
+    movss [rcx].mat4.m[6], xmm0
+    ; r.m[8] = a.z * a.x * t - a.y * s
+    movss xmm0, rotate_axis.z
+    mulss xmm0, rotate_axis.x
+    mulss xmm0, xmm5
+    movss xmm1, rotate_axis.y
+    mulss xmm1, xmm3
+    subss xmm0, xmm1
+    movss [rcx].mat4.m[8], xmm0
+    ; r.m[9] = a.z * a.y * t + a.x * s
+    movss xmm0, rotate_axis.z
+    mulss xmm0, rotate_axis.y
+    mulss xmm0, xmm5
+    movss xmm1, rotate_axis.x
+    mulss xmm1, xmm3
+    addss xmm0, xmm1
+    movss [rcx].mat4.m[9], xmm0
+    ; r.m[10] = c + a.z * a.z * t
+    movss xmm0, rotate_axis.z
+    mulss xmm0, rotate_axis.z
+    mulss xmm0, xmm5
+    addss xmm0, xmm4
+    movss [rcx].mat4.m[10], xmm0
+    add rsp, 40
+    ret
+}
+
+; rcx: out, xmm1: fovy in radians, xmm2: aspect, xmm3: z_near, [rsp + 40]: z_far
+;
+; Right-handed perspective onto D3D's 0..1 depth range. aspect and z_near
+; stay in xmm2 and xmm3 across tanf, which touches only xmm0; rcx is
+; untouched too. The sub is still needed: tanf uses its shadow space, which
+; without it would be this proc's return address.
+m4_perspective: proc(out: *mat4, fovy: f32, aspect: f32, z_near: f32, z_far: f32) = {
+    sub rsp, 40                            ; tanf's shadow space; z_far is now at [rsp + 80]
+    movaps xmm0, xmm1
+    mulss xmm0, 0.5
+    call tanf
+    movss xmm1, 1.0
+    divss xmm1, xmm0                       ; f = 1 / tan(fovy / 2)
+
+    xorps xmm0, xmm0
+    movups xmmword ptr [rcx], xmm0
+    movups xmmword ptr [rcx + 16], xmm0
+    movups xmmword ptr [rcx + 32], xmm0
+    movups xmmword ptr [rcx + 48], xmm0
+    movss xmm0, xmm1
+    divss xmm0, xmm2
+    movss [rcx].mat4.m[0], xmm0            ; f / aspect
+    movss [rcx].mat4.m[5], xmm1            ; f
+    movss xmm4, dword ptr [rsp + 80]       ; z_far
+    movaps xmm2, xmm3
+    subss xmm2, xmm4                       ; near - far
+    movaps xmm0, xmm4
+    divss xmm0, xmm2
+    movss [rcx].mat4.m[10], xmm0           ; far / (near - far)
+    movaps xmm0, xmm3
+    mulss xmm0, xmm4
+    divss xmm0, xmm2
+    movss [rcx].mat4.m[11], xmm0           ; near * far / (near - far)
+    mov dword ptr [rcx].mat4.m[14], 0xBF800000    ; -1
+    add rsp, 40
+    ret
+}
+
+; rcx: out, xmm1: left, xmm2: right, xmm3: bottom, [rsp + 40]: top,
+; [rsp + 48]: z_near, [rsp + 56]: z_far
+;
+; Right-handed orthographic projection onto 0..1 depth. No frame: the stack
+; arguments are read where the caller put them, and m4_identity, a leaf,
+; leaves xmm1-xmm3 alone.
+m4_ortho: proc(out: *mat4, left: f32, right: f32, bottom: f32, top: f32, z_near: f32, z_far: f32) = {
+    call m4_identity
+    ; 2 / (right - left), -(right + left) / (right - left)
+    movaps xmm0, xmm2
+    subss xmm0, xmm1                       ; right - left
+    movss xmm4, 2.0
+    divss xmm4, xmm0
+    movss [rcx].mat4.m[0], xmm4
+    movaps xmm4, xmm2
+    addss xmm4, xmm1
+    divss xmm4, xmm0
+    xorps xmm4, math_sign_mask
+    movss [rcx].mat4.m[3], xmm4
+    ; 2 / (top - bottom), -(top + bottom) / (top - bottom)
+    movss xmm0, dword ptr [rsp + 40]       ; top
+    movaps xmm5, xmm0
+    subss xmm0, xmm3                       ; top - bottom
+    movss xmm4, 2.0
+    divss xmm4, xmm0
+    movss [rcx].mat4.m[5], xmm4
+    addss xmm5, xmm3                       ; top + bottom
+    divss xmm5, xmm0
+    xorps xmm5, math_sign_mask
+    movss [rcx].mat4.m[7], xmm5
+    ; 1 / (near - far), near / (near - far)
+    movss xmm0, dword ptr [rsp + 48]
+    subss xmm0, dword ptr [rsp + 56]       ; near - far
+    movss xmm4, 1.0
+    divss xmm4, xmm0
+    movss [rcx].mat4.m[10], xmm4
+    movss xmm4, dword ptr [rsp + 48]
+    divss xmm4, xmm0
+    movss [rcx].mat4.m[11], xmm4
+    ret
+}
+
+; m4_look_at's: math.asm's `local f:vec3, s:vec3, u:vec3`
+look_at_f: vec3 = {}                       ; forward
+look_at_s: vec3 = {}                       ; side (right)
+look_at_u: vec3 = {}                       ; up
+
+; rcx: out, rdx: eye, r8: target, r9: up (all vec3)
+;
+; The view matrix of a camera at `eye` looking at `target`.
+m4_look_at: proc(out: *mat4, eye: *const vec3, target: *const vec3, up: *const vec3) = {
+    push rbx
+    push rsi
+    push rdi
+    sub rsp, 32                            ; 32 shadow; entry 8 + three pushes 24 + 32 lands on 16
+    mov rbx, rcx                           ; out
+    mov rsi, rdx                           ; eye
+    mov rdi, r9                            ; up
+
+    lea rcx, look_at_f                     ; f = normalize(target - eye)
+    mov rdx, r8
+    mov r8, rsi
+    call v3_sub
+    lea rcx, look_at_f
+    lea rdx, look_at_f
+    call v3_normalize
+    lea rcx, look_at_s                     ; s = normalize(cross(f, up))
+    lea rdx, look_at_f
+    mov r8, rdi
+    call v3_cross
+    lea rcx, look_at_s
+    lea rdx, look_at_s
+    call v3_normalize
+    lea rcx, look_at_u                     ; u = cross(s, f)
+    lea rdx, look_at_s
+    lea r8, look_at_f
+    call v3_cross
+
+    mov rcx, rbx
+    call m4_identity
+    v3load(xmm4, rsi)                      ; eye
+    ; row 0: s, -dot(s, eye)
+    v3load_var(xmm0, look_at_s)
+    movups xmmword ptr [rcx], xmm0
+    dpps xmm0, xmm4, 0x71
+    xorps xmm0, math_sign_mask
+    movss [rcx].mat4.m[3], xmm0
+    ; row 1: u, -dot(u, eye)
+    v3load_var(xmm0, look_at_u)
+    movups xmmword ptr [rcx + 16], xmm0
+    dpps xmm0, xmm4, 0x71
+    xorps xmm0, math_sign_mask
+    movss [rcx].mat4.m[7], xmm0
+    ; row 2: -f, dot(f, eye)
+    v3load_var(xmm0, look_at_f)
+    movaps xmm1, xmm0
+    xorps xmm1, math_sign_mask
+    movups xmmword ptr [rcx + 32], xmm1
+    dpps xmm0, xmm4, 0x71
+    movss [rcx].mat4.m[11], xmm0
+    add rsp, 32
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+}
+
+; rcx: out, rdx: a -> a with its translation removed: what a skybox is drawn
+; with, so it turns with the camera but never gets closer.
+m4_without_translation: proc(out: *mat4, a: *const mat4) = {
+    movups xmm0, xmmword ptr [rdx]
+    movups xmm1, xmmword ptr [rdx + 16]
+    movups xmm2, xmmword ptr [rdx + 32]
+    movups xmmword ptr [rcx], xmm0
+    movups xmmword ptr [rcx + 16], xmm1
+    movups xmmword ptr [rcx + 32], xmm2
+    xor eax, eax
+    mov [rcx].mat4.m[3], eax
+    mov [rcx].mat4.m[7], eax
+    mov [rcx].mat4.m[11], eax
+    mov [rcx].mat4.m[12], eax
+    mov [rcx].mat4.m[13], eax
+    mov [rcx].mat4.m[14], eax
+    mov dword ptr [rcx].mat4.m[15], 0x3F800000
+    ret
+}
+
+m4_inverse_work: [32]f32 = {}              ; 4 rows of 8: a, then the identity
+
+; One row of the result: the right half of row `row` of the work.
+m4_inverse_row_out: macro(row) = {
+    movups xmm0, xmmword ptr [r9 + row * 32 + 16]
+    movups xmmword ptr [rcx + row * 16], xmm0
+}
+
+; rcx: out, rdx: a -> the inverse of a. A singular matrix comes back
+; unchanged. rcx is out again on return.
+;
+; Gauss-Jordan elimination: [a | I] is row-reduced until the left half is I,
+; which leaves the inverse on the right. Each step picks the largest
+; remaining entry in the column as the pivot.
+m4_inverse: proc(out: *mat4, a: *const mat4) = {
+    push rbx
+    push rsi
+    push rdi
+    push r12
+    mov r12, rcx                           ; out
+    mov r11, rdx                           ; a
+
+    ; work = [a | I]
+    lea r9, m4_inverse_work
+    xor ecx, ecx
+  fill:
+    mov rax, rcx
+    shl rax, 5                             ; row * 32 bytes
+    mov rdx, rcx
+    shl rdx, 4                             ; row * 16 bytes
+    movups xmm0, xmmword ptr [r11 + rdx]
+    movups xmmword ptr [r9 + rax], xmm0
+    xorps xmm0, xmm0
+    movups xmmword ptr [r9 + rax + 16], xmm0
+    lea rdx, [rax + rcx * 4]
+    mov dword ptr [r9 + rdx + 16], 0x3F800000
+    inc ecx
+    cmp ecx, 4
+    jb fill
+
+    xor ebx, ebx                           ; column
+  columns:
+    ; the pivot: the row from `column` down with the largest |entry|
+    mov edi, ebx
+    mov rax, rbx
+    shl rax, 5
+    lea r10, [r9 + rax]
+    movss xmm1, dword ptr [r10 + rbx * 4]
+    andps xmm1, math_abs_mask
+    lea esi, [rbx + 1]
+  pivot_search:
+    cmp esi, 4
+    jae pivot_found
+    mov rax, rsi
+    shl rax, 5
+    lea r10, [r9 + rax]
+    movss xmm0, dword ptr [r10 + rbx * 4]
+    andps xmm0, math_abs_mask
+    comiss xmm0, xmm1
+    jbe not_larger
+    movss xmm1, xmm0
+    mov edi, esi
+  not_larger:
+    inc esi
+    jmp pivot_search
+  pivot_found:
+    xorps xmm0, xmm0
+    comiss xmm1, xmm0
+    je singular
+
+    ; swap the pivot row into place
+    mov rax, rdi
+    shl rax, 5
+    mov rdx, rbx
+    shl rdx, 5
+    movups xmm0, xmmword ptr [r9 + rax]
+    movups xmm1, xmmword ptr [r9 + rax + 16]
+    movups xmm2, xmmword ptr [r9 + rdx]
+    movups xmm3, xmmword ptr [r9 + rdx + 16]
+    movups xmmword ptr [r9 + rdx], xmm0
+    movups xmmword ptr [r9 + rdx + 16], xmm1
+    movups xmmword ptr [r9 + rax], xmm2
+    movups xmmword ptr [r9 + rax + 16], xmm3
+
+    ; scale the pivot row so the pivot is 1
+    movss xmm4, 1.0
+    lea r10, [r9 + rdx]
+    divss xmm4, dword ptr [r10 + rbx * 4]
+    splat(xmm4)
+    movups xmm0, xmmword ptr [r9 + rdx]
+    mulps xmm0, xmm4
+    movups xmmword ptr [r9 + rdx], xmm0
+    movups xmm1, xmmword ptr [r9 + rdx + 16]
+    mulps xmm1, xmm4
+    movups xmmword ptr [r9 + rdx + 16], xmm1
+
+    ; subtract it from every other row, clearing the column
+    xor esi, esi
+  eliminate:
+    cmp esi, ebx
+    je next_row
+    mov rax, rsi
+    shl rax, 5
+    lea r10, [r9 + rax]
+    movss xmm4, dword ptr [r10 + rbx * 4]
+    splat(xmm4)
+    movaps xmm2, xmm0
+    mulps xmm2, xmm4
+    movups xmm3, xmmword ptr [r9 + rax]
+    subps xmm3, xmm2
+    movups xmmword ptr [r9 + rax], xmm3
+    movaps xmm2, xmm1
+    mulps xmm2, xmm4
+    movups xmm3, xmmword ptr [r9 + rax + 16]
+    subps xmm3, xmm2
+    movups xmmword ptr [r9 + rax + 16], xmm3
+  next_row:
+    inc esi
+    cmp esi, 4
+    jb eliminate
+
+    inc ebx
+    cmp ebx, 4
+    jb columns
+
+    ; the right half is the inverse
+    mov rcx, r12
+    m4_inverse_row_out(0)
+    m4_inverse_row_out(1)
+    m4_inverse_row_out(2)
+    m4_inverse_row_out(3)
+    jmp done
+
+  singular:
+    mov rcx, r12
+    m4_copy(rcx, r11)
+
+  done:
+    pop r12
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+}
+
+; rcx: out, rdx: model -> what normals are transformed by: the inverse
+; transpose of the model matrix, so a non-uniform scale does not tilt them.
+m4_normal_matrix: proc(out: *mat4, model: *const mat4) = {
+    call m4_inverse                        ; a leaf; leaves rcx = out
+    mov rdx, rcx
+    jmp m4_transpose                       ; transpose in place, and return from there
+}

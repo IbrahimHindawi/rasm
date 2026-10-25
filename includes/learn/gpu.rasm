@@ -1,0 +1,423 @@
+; gpu: buffers, constants, textures and samplers
+;
+; The D3D11 calls the early lessons write out, once each, gathered for the
+; later ones:
+;
+;   create_buffer            an immutable vertex or index buffer (2.1 hello triangle)
+;   create_constant_buffer   a constant buffer the CPU rewrites (3.1 shaders)
+;   update_buffer            rewriting it (3.1 shaders)
+;   bind_constants           the same constant buffer for every stage (5.1 transformations)
+;   load_texture             an image file as a texture with mipmaps (4.1 textures)
+;   create_sampler           filtering and wrapping (4.1 textures)
+;   bind_texture             one texture in one register
+;   unbind_textures          t0..t7 cleared, before drawing into a texture that was being read
+;   set_viewport             the part of the render target drawn into
+;   create_render_target     a texture to draw into and then read (5.1 framebuffers)
+;   create_depth_buffer      a depth buffer of any size (5.1 framebuffers)
+;   load_cubemap             six images as a cubemap (6.1 cubemaps)
+;   load_hdr                 a Radiance .hdr as a float texture
+;   create_shadow_sampler    a comparison sampler for shadow maps
+;
+; They work on the device and context that window_create made. Each one's
+; descriptions are globals named after it, initialised with whatever does not
+; change between calls.
+
+import "../d3d11.rin"
+import "../calls.rasm"
+import "../macros.rasm"
+import "../cstr.rasm"
+import "../print.rasm"
+import "../image.rasm"
+import "window.rasm"
+
+; create_buffer's
+create_buffer_desc: D3D11_BUFFER_DESC = { .Usage = D3D11_USAGE.D3D11_USAGE_IMMUTABLE }
+create_buffer_init: D3D11_SUBRESOURCE_DATA = {}
+create_buffer_out: *ID3D11Buffer = {}
+
+; ecx: bind flags, rdx: data, r8d: size -> rax: ID3D11Buffer
+;
+; An immutable buffer: filled once at creation, never written by the CPU again.
+create_buffer: proc(bind: u32, data: *const void, size: u32) -> *ID3D11Buffer = {
+    sub rsp, 40                            ; 32 shadow, and rsp back on 16
+    mov create_buffer_desc.ByteWidth, r8d
+    mov create_buffer_desc.BindFlags, ecx
+    mov create_buffer_init.pSysMem, rdx
+    vcall(device, ID3D11DeviceVtbl.CreateBuffer, create_buffer_desc&, create_buffer_init&, create_buffer_out&)
+    assert_hr()
+    mov rax, create_buffer_out
+    add rsp, 40
+    ret
+}
+
+; create_constant_buffer's
+create_constant_buffer_desc: D3D11_BUFFER_DESC = {
+    .Usage = D3D11_USAGE.D3D11_USAGE_DYNAMIC,
+    .BindFlags = D3D11_BIND_FLAG.D3D11_BIND_CONSTANT_BUFFER,
+    .CPUAccessFlags = D3D11_CPU_ACCESS_FLAG.D3D11_CPU_ACCESS_WRITE,
+}
+create_constant_buffer_out: *ID3D11Buffer = {}
+
+; ecx: size -> rax: ID3D11Buffer
+;
+; A constant buffer the CPU rewrites, usually every frame. Its size must be a
+; multiple of 16 bytes, the size of one HLSL register.
+create_constant_buffer: proc(size: u32) -> *ID3D11Buffer = {
+    sub rsp, 40                            ; 32 shadow, and rsp back on 16
+    mov create_constant_buffer_desc.ByteWidth, ecx
+    vcall(device, ID3D11DeviceVtbl.CreateBuffer, create_constant_buffer_desc&, 0, create_constant_buffer_out&)
+    assert_hr()
+    mov rax, create_constant_buffer_out
+    add rsp, 40
+    ret
+}
+
+update_buffer_mapped: D3D11_MAPPED_SUBRESOURCE = {}
+
+; rcx: buffer, rdx: data, r8: size
+;
+; WRITE_DISCARD hands back fresh memory each time, so the GPU never waits on
+; the CPU, and a draw already recorded keeps the values it saw.
+update_buffer: proc(buffer: *ID3D11Buffer, data: *const void, size: u64) = {
+    push rbx
+    push rsi
+    push rdi
+    sub rsp, 48                            ; Map takes 6: 32 + 16; entry 8 + three pushes 24 + 48 lands on 16
+    mov rbx, rcx                           ; buffer
+    mov rsi, rdx                           ; data
+    mov rdi, r8                            ; size
+    vcall(context, ID3D11DeviceContextVtbl.Map, rbx, 0, D3D11_MAP.D3D11_MAP_WRITE_DISCARD, 0, update_buffer_mapped&)
+    assert_hr()
+    invoke(mem_copy, update_buffer_mapped.pData, rsi, rdi)
+    vcall(context, ID3D11DeviceContextVtbl.Unmap, rbx, 0)
+    add rsp, 48
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+}
+
+bind_constants_buffer: *ID3D11Buffer = {}  ; the array of one that the Set calls take
+
+; ecx: register (b0, b1, ...), rdx: buffer
+;
+; The same buffer in the same register for the vertex, geometry and pixel stages.
+bind_constants: proc(slot: u32, buffer: *ID3D11Buffer) = {
+    push rbx
+    sub rsp, 32                            ; 32 shadow; entry 8 + push 8 + 32 lands on 16
+    mov ebx, ecx
+    mov bind_constants_buffer, rdx
+    vcall(context, ID3D11DeviceContextVtbl.VSSetConstantBuffers, rbx, 1, bind_constants_buffer&)
+    vcall(context, ID3D11DeviceContextVtbl.GSSetConstantBuffers, rbx, 1, bind_constants_buffer&)
+    vcall(context, ID3D11DeviceContextVtbl.PSSetConstantBuffers, rbx, 1, bind_constants_buffer&)
+    add rsp, 32
+    pop rbx
+    ret
+}
+
+; load_texture's
+load_texture_image: image = {}
+load_texture_desc: D3D11_TEXTURE2D_DESC = {
+    .MipLevels = 0,                        ; the whole chain
+    .ArraySize = 1,
+    .SampleDesc = { .Count = 1 },
+    ; Generating mips draws into the texture, so it is a render target too.
+    .BindFlags = D3D11_BIND_FLAG.D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_FLAG.D3D11_BIND_RENDER_TARGET,
+    .MiscFlags = D3D11_RESOURCE_MISC_FLAG.D3D11_RESOURCE_MISC_GENERATE_MIPS,
+}
+load_texture_texture: *ID3D11Texture2D = {}
+load_texture_srv: *ID3D11ShaderResourceView = {}
+
+; rcx: path, edx: 1 for colour data -> rax: ID3D11ShaderResourceView
+;
+; A 2D texture from an image file, with a full mip chain. `srgb`: the file
+; stores colours, gamma encoded, and sampling should decode them to linear.
+; Data such as normals or roughness is linear already.
+load_texture: proc(path: *const c8, srgb: b32) -> *ID3D11ShaderResourceView = {
+    push rbx
+    push rsi
+    sub rsp, 56                            ; UpdateSubresource takes 7: 32 + 24; entry 8 + 16 + 56 lands on 16
+    mov rbx, rcx                           ; path
+    mov esi, edx                           ; srgb
+    invoke(image_load, load_texture_image&, rbx)
+    test rax, rax
+    jnz loaded
+    invoke(print, "Texture failed to load at path: %s\n", rbx)
+    invoke(ExitProcess, 1)
+  loaded:
+    mov eax, load_texture_image.width
+    mov load_texture_desc.Width, eax
+    mov eax, load_texture_image.height
+    mov load_texture_desc.Height, eax
+    mov load_texture_desc.Format, DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM
+    test esi, esi
+    jz linear
+    mov load_texture_desc.Format, DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+  linear:
+    vcall(device, ID3D11DeviceVtbl.CreateTexture2D, load_texture_desc&, 0, load_texture_texture&)
+    assert_hr()
+    vcall(device, ID3D11DeviceVtbl.CreateShaderResourceView, load_texture_texture, 0, load_texture_srv&)
+    mov eax, load_texture_image.width
+    shl eax, 2                             ; the row pitch
+    vcall(context, ID3D11DeviceContextVtbl.UpdateSubresource, load_texture_texture, 0, 0, load_texture_image.pixels, rax, 0)
+    vcall(context, ID3D11DeviceContextVtbl.GenerateMips, load_texture_srv)
+    release(load_texture_texture)          ; the view keeps it alive
+    mov rax, load_texture_srv
+    add rsp, 56
+    pop rsi
+    pop rbx
+    ret
+}
+
+bind_texture_srv: *ID3D11ShaderResourceView = {}
+
+; ecx: register (t0, t1, ...), rdx: ID3D11ShaderResourceView, for the pixel shader
+bind_texture: proc(slot: u32, srv: *ID3D11ShaderResourceView) = {
+    sub rsp, 40                            ; 32 shadow, and rsp back on 16
+    mov bind_texture_srv, rdx
+    mov edx, ecx                           ; the slot, out of rcx before vcall puts the context there
+    vcall(context, ID3D11DeviceContextVtbl.PSSetShaderResources, rdx, 1, bind_texture_srv&)
+    add rsp, 40
+    ret
+}
+
+unbind_textures_views: [8]*ID3D11ShaderResourceView = {}    ; always zero
+
+; Clears the pixel shader's texture registers t0..t7. A texture cannot be read
+; and drawn into at once, so this runs before drawing into one that was just
+; being read.
+unbind_textures: proc() = {
+    sub rsp, 40                            ; 32 shadow, and rsp back on 16
+    vcall(context, ID3D11DeviceContextVtbl.PSSetShaderResources, 0, 8, unbind_textures_views&)
+    add rsp, 40
+    ret
+}
+
+set_viewport_vp: D3D11_VIEWPORT = { .MaxDepth = 1.0 }
+
+; ecx: width, edx: height (pixels). Draw into that much of the render target.
+set_viewport: proc(w: u32, h: u32) = {
+    sub rsp, 40                            ; 32 shadow, and rsp back on 16
+    cvtsi2ss xmm0, ecx
+    movss set_viewport_vp.Width, xmm0
+    cvtsi2ss xmm0, edx
+    movss set_viewport_vp.Height, xmm0
+    vcall(context, ID3D11DeviceContextVtbl.RSSetViewports, 1, set_viewport_vp&)
+    add rsp, 40
+    ret
+}
+
+; A texture that can be drawn into (rtv) and then read (srv): GL's
+; framebuffer colour attachment.
+render_target: struct = {
+    texture: *ID3D11Texture2D
+    rtv: *ID3D11RenderTargetView
+    srv: *ID3D11ShaderResourceView
+}
+
+create_render_target_desc: D3D11_TEXTURE2D_DESC = {
+    .MipLevels = 1,
+    .ArraySize = 1,
+    .BindFlags = D3D11_BIND_FLAG.D3D11_BIND_RENDER_TARGET | D3D11_BIND_FLAG.D3D11_BIND_SHADER_RESOURCE,
+}
+
+; rcx: render_target, edx: width, r8d: height, r9d: format, [rsp + 40]: samples (1 unless MSAA)
+create_render_target: proc(out: *render_target, w: u32, h: u32, format: DXGI_FORMAT, samples: u32) = {
+    push rbx
+    sub rsp, 32                            ; 32 shadow; entry 8 + push 8 + 32 lands on 16
+    mov rbx, rcx
+    mov create_render_target_desc.Width, edx
+    mov create_render_target_desc.Height, r8d
+    mov create_render_target_desc.Format, r9d
+    mov eax, dword ptr [rsp + 80]          ; samples: [rsp + 40] on entry, + 8 + 32
+    mov create_render_target_desc.SampleDesc.Count, eax
+    lea rax, [rbx].render_target.texture
+    vcall(device, ID3D11DeviceVtbl.CreateTexture2D, create_render_target_desc&, 0, rax)
+    assert_hr()
+    lea rax, [rbx].render_target.rtv
+    vcall(device, ID3D11DeviceVtbl.CreateRenderTargetView, [rbx].render_target.texture, 0, rax)
+    lea rax, [rbx].render_target.srv
+    vcall(device, ID3D11DeviceVtbl.CreateShaderResourceView, [rbx].render_target.texture, 0, rax)
+    add rsp, 32
+    pop rbx
+    ret
+}
+
+; create_depth_buffer's
+create_depth_buffer_desc: D3D11_TEXTURE2D_DESC = {
+    .MipLevels = 1,
+    .ArraySize = 1,
+    .Format = DXGI_FORMAT.DXGI_FORMAT_D24_UNORM_S8_UINT,
+    .BindFlags = D3D11_BIND_FLAG.D3D11_BIND_DEPTH_STENCIL,
+}
+create_depth_buffer_texture: *ID3D11Texture2D = {}
+create_depth_buffer_dsv: *ID3D11DepthStencilView = {}
+
+; ecx: width, edx: height, r8d: samples -> rax: ID3D11DepthStencilView of a
+; new depth buffer, 24 bits of depth and 8 of stencil
+create_depth_buffer: proc(w: u32, h: u32, samples: u32) -> *ID3D11DepthStencilView = {
+    sub rsp, 40                            ; 32 shadow, and rsp back on 16
+    mov create_depth_buffer_desc.Width, ecx
+    mov create_depth_buffer_desc.Height, edx
+    mov create_depth_buffer_desc.SampleDesc.Count, r8d
+    vcall(device, ID3D11DeviceVtbl.CreateTexture2D, create_depth_buffer_desc&, 0, create_depth_buffer_texture&)
+    assert_hr()
+    vcall(device, ID3D11DeviceVtbl.CreateDepthStencilView, create_depth_buffer_texture, 0, create_depth_buffer_dsv&)
+    release(create_depth_buffer_texture)   ; the view keeps it alive
+    mov rax, create_depth_buffer_dsv
+    add rsp, 40
+    ret
+}
+
+; load_cubemap's
+load_cubemap_data: [6]D3D11_SUBRESOURCE_DATA = {}
+load_cubemap_image: image = {}
+load_cubemap_desc: D3D11_TEXTURE2D_DESC = {
+    .MipLevels = 1,
+    .ArraySize = 6,
+    .Format = DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM,
+    .SampleDesc = { .Count = 1 },
+    .BindFlags = D3D11_BIND_FLAG.D3D11_BIND_SHADER_RESOURCE,
+    .MiscFlags = D3D11_RESOURCE_MISC_FLAG.D3D11_RESOURCE_MISC_TEXTURECUBE,
+}
+load_cubemap_view: D3D11_SHADER_RESOURCE_VIEW_DESC = {
+    .Format = DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM,
+    .ViewDimension = D3D_SRV_DIMENSION.D3D_SRV_DIMENSION_TEXTURECUBE,
+    .TextureCube = { .MipLevels = 1 },
+}
+load_cubemap_texture: *ID3D11Texture2D = {}
+load_cubemap_srv: *ID3D11ShaderResourceView = {}
+
+; rcx: six image paths (an array of pointers: +x, -x, +y, -y, +z, -z) -> rax:
+; a cubemap's view
+;
+; A cubemap is a texture array of six squares with a flag saying it is a
+; cube; its faces are in the same order as GL's.
+load_cubemap: proc(paths: *const *const c8) -> *ID3D11ShaderResourceView = {
+    push rbx
+    push rsi
+    push rdi
+    sub rsp, 32                            ; 32 shadow; entry 8 + three pushes 24 + 32 lands on 16
+    mov rdi, rcx                           ; paths
+    xor ebx, ebx
+    lea rsi, load_cubemap_data
+  faces:
+    invoke(image_load, load_cubemap_image&, [rdi + rbx * 8])
+    test rax, rax
+    jnz loaded
+    invoke(print, "Cubemap texture failed to load at path: %s\n", [rdi + rbx * 8])
+    invoke(ExitProcess, 1)
+  loaded:
+    mov [rsi].D3D11_SUBRESOURCE_DATA.pSysMem, rax
+    mov eax, load_cubemap_image.width
+    shl eax, 2
+    mov [rsi].D3D11_SUBRESOURCE_DATA.SysMemPitch, eax
+    mov dword ptr [rsi].D3D11_SUBRESOURCE_DATA.SysMemSlicePitch, 0
+    add rsi, sizeof(D3D11_SUBRESOURCE_DATA)
+    inc ebx
+    cmp ebx, 6
+    jb faces
+    mov eax, load_cubemap_image.width      ; every face is this square
+    mov load_cubemap_desc.Width, eax
+    mov load_cubemap_desc.Height, eax
+    vcall(device, ID3D11DeviceVtbl.CreateTexture2D, load_cubemap_desc&, load_cubemap_data&, load_cubemap_texture&)
+    assert_hr()
+    vcall(device, ID3D11DeviceVtbl.CreateShaderResourceView, load_cubemap_texture, load_cubemap_view&, load_cubemap_srv&)
+    release(load_cubemap_texture)
+    mov rax, load_cubemap_srv
+    add rsp, 32
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+}
+
+; load_hdr's
+load_hdr_image: image = {}
+load_hdr_desc: D3D11_TEXTURE2D_DESC = {
+    .MipLevels = 1,
+    .ArraySize = 1,
+    .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32B32A32_FLOAT,
+    .SampleDesc = { .Count = 1 },
+    .BindFlags = D3D11_BIND_FLAG.D3D11_BIND_SHADER_RESOURCE,
+}
+load_hdr_init: D3D11_SUBRESOURCE_DATA = {}
+load_hdr_texture: *ID3D11Texture2D = {}
+load_hdr_srv: *ID3D11ShaderResourceView = {}
+
+; rcx: path of a Radiance .hdr -> rax: its view, as linear float RGBA
+load_hdr: proc(path: *const c8) -> *ID3D11ShaderResourceView = {
+    push rbx
+    sub rsp, 32                            ; 32 shadow; entry 8 + push 8 + 32 lands on 16
+    mov rbx, rcx
+    invoke(image_load_hdr, load_hdr_image&, rbx)
+    test rax, rax
+    jnz loaded
+    invoke(print, "Failed to load HDR image: %s\n", rbx)
+    invoke(ExitProcess, 1)
+  loaded:
+    mov eax, load_hdr_image.width
+    mov load_hdr_desc.Width, eax
+    shl eax, 4                             ; 16 bytes a pixel
+    mov load_hdr_init.SysMemPitch, eax
+    mov eax, load_hdr_image.height
+    mov load_hdr_desc.Height, eax
+    mov rax, load_hdr_image.pixels
+    mov load_hdr_init.pSysMem, rax
+    vcall(device, ID3D11DeviceVtbl.CreateTexture2D, load_hdr_desc&, load_hdr_init&, load_hdr_texture&)
+    assert_hr()
+    vcall(device, ID3D11DeviceVtbl.CreateShaderResourceView, load_hdr_texture, 0, load_hdr_srv&)
+    release(load_hdr_texture)
+    mov rax, load_hdr_srv
+    add rsp, 32
+    pop rbx
+    ret
+}
+
+; create_shadow_sampler's. Outside the map the border is 1, the far plane, so
+; nothing there is in shadow.
+create_shadow_sampler_desc: D3D11_SAMPLER_DESC = {
+    .Filter = D3D11_FILTER.D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT,
+    .AddressU = D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_BORDER,
+    .AddressV = D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_BORDER,
+    .AddressW = D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_BORDER,
+    .ComparisonFunc = D3D11_COMPARISON_FUNC.D3D11_COMPARISON_LESS_EQUAL,
+    .BorderColor = { 1.0, 1.0, 1.0, 1.0 },
+    .MaxLOD = D3D11_FLOAT32_MAX,
+}
+create_shadow_sampler_out: *ID3D11SamplerState = {}
+
+; -> rax: a sampler that compares instead of filtering, for shadow maps:
+; hardware PCF
+create_shadow_sampler: proc() -> *ID3D11SamplerState = {
+    sub rsp, 40                            ; 32 shadow, and rsp back on 16
+    vcall(device, ID3D11DeviceVtbl.CreateSamplerState, create_shadow_sampler_desc&, create_shadow_sampler_out&)
+    assert_hr()
+    mov rax, create_shadow_sampler_out
+    add rsp, 40
+    ret
+}
+
+; create_sampler's
+create_sampler_desc: D3D11_SAMPLER_DESC = {
+    .MaxAnisotropy = 8,
+    .ComparisonFunc = D3D11_COMPARISON_FUNC.D3D11_COMPARISON_NEVER,
+    .MaxLOD = D3D11_FLOAT32_MAX,
+}
+create_sampler_out: *ID3D11SamplerState = {}
+
+; ecx: filter, edx: address mode -> rax: ID3D11SamplerState
+;
+; How textures are filtered, and what happens past their edges.
+create_sampler: proc(filter: D3D11_FILTER, address: D3D11_TEXTURE_ADDRESS_MODE) -> *ID3D11SamplerState = {
+    sub rsp, 40                            ; 32 shadow, and rsp back on 16
+    mov create_sampler_desc.Filter, ecx
+    mov create_sampler_desc.AddressU, edx
+    mov create_sampler_desc.AddressV, edx
+    mov create_sampler_desc.AddressW, edx
+    vcall(device, ID3D11DeviceVtbl.CreateSamplerState, create_sampler_desc&, create_sampler_out&)
+    assert_hr()
+    mov rax, create_sampler_out
+    add rsp, 40
+    ret
+}

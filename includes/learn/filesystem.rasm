@@ -1,0 +1,145 @@
+; filesystem: paths under the repository root, wherever the executable was run from
+;
+; LearnOpenGL's FileSystem::getPath. The root is found by walking up from the
+; executable until a directory holds `resources`: a lesson's exe is in
+; build/, so that is one level up, but a copy run from anywhere under the
+; repository still finds it.
+;
+;     invoke(filesystem_path, "resources/textures/container.jpg")   ; rax = the full path
+;     invoke(filesystem_read, rax, size&)                            ; rax = the bytes, size stored
+;
+; Paths and file contents live in the arena for as long as the program runs.
+
+import "../d3d11.rin"
+import "../calls.rasm"
+import "../saha.rasm"
+import "../cstr.rasm"
+import "../print.rasm"
+
+filesystem_root: [260]u8 = {}              ; the repository root, once found
+filesystem_probe: [260]u8 = {}             ; filesystem_find_root's candidate: root + "/resources"
+filesystem_read_file: HANDLE = {}          ; filesystem_read's
+filesystem_read_size: LARGE_INTEGER = {}
+filesystem_read_got: u32 = 0
+
+; Fills filesystem_root, and starts the arena if nothing has yet.
+filesystem_find_root: proc() = {
+    push rbx
+    push rsi
+    sub rsp, 40                            ; 32 shadow; entry 8 + two pushes 16 + 40 lands on 16
+    cmp arena.base, 0
+    jne have_arena
+    invoke(arenaInit, arena&)
+  have_arena:
+    invoke(GetModuleFileNameA, 0, filesystem_root&, 260)
+    mov ebx, 8                             ; levels to try
+  up:
+    ; cut the path at its last slash
+    lea rsi, filesystem_root
+    xor ecx, ecx
+    mov rdx, -1
+  scan:
+    mov al, [rsi + rcx]
+    test al, al
+    jz scanned
+    cmp al, '\\'
+    je slash
+    cmp al, '/'
+    jne not_slash
+  slash:
+    mov rdx, rcx
+  not_slash:
+    inc rcx
+    jmp scan
+  scanned:
+    cmp rdx, -1
+    je missing
+    mov byte ptr [rsi + rdx], 0
+    invoke(cstr_copy, filesystem_probe&, filesystem_root&)
+    invoke(cstr_append, filesystem_probe&, "/resources")
+    invoke(GetFileAttributesA, filesystem_probe&)
+    cmp eax, INVALID_FILE_ATTRIBUTES
+    je not_here
+    test eax, FILE_ATTRIBUTE_DIRECTORY
+    jnz found
+  not_here:
+    dec ebx
+    jnz up
+  missing:
+    invoke(print, "filesystem: no resources directory above the executable\n")
+    invoke(ExitProcess, 1)
+  found:
+    add rsp, 40
+    pop rsi
+    pop rbx
+    ret
+}
+
+; rcx: path relative to the repository root -> rax: the full path
+filesystem_path: proc(relative: *const c8) -> *c8 = {
+    push rbx
+    push rsi
+    sub rsp, 40                            ; 32 shadow; entry 8 + two pushes 16 + 40 lands on 16
+    mov rsi, rcx                           ; the relative path
+    cmp filesystem_root[0], 0
+    jne have_root
+    call filesystem_find_root
+  have_root:
+    invoke(cstr_length, filesystem_root&)
+    mov rbx, rax
+    invoke(cstr_length, rsi)
+    lea rax, [rbx + rax + 2]               ; root, "/", relative, the terminator
+    invoke(arenaPush, arena&, rax, 1)
+    mov rbx, rax
+    invoke(cstr_copy, rbx, filesystem_root&)
+    invoke(cstr_append, rbx, "/")
+    invoke(cstr_append, rbx, rsi)
+    mov rax, rbx
+    add rsp, 40
+    pop rsi
+    pop rbx
+    ret
+}
+
+; rcx: path, rdx: where to write the size (or 0) -> rax: the whole file,
+; followed by a zero byte so text can be read in place; 0 if it cannot be opened
+filesystem_read: proc(path: *const c8, size_out: *u64) -> *u8 = {
+    push rbx
+    push rsi
+    sub rsp, 56                            ; CreateFileA takes 7: 32 + 3 * 8; entry 8 + 16 + 56 lands on 16
+    mov rsi, rdx                           ; size_out
+    mov rbx, rcx                           ; the path
+    cmp filesystem_root[0], 0
+    jne have_root
+    call filesystem_find_root
+  have_root:
+    invoke(CreateFileA, rbx, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0)
+    cmp rax, INVALID_HANDLE_VALUE
+    jne opened
+    xor eax, eax
+    jmp done
+  opened:
+    mov filesystem_read_file, rax
+    invoke(GetFileSizeEx, rax, filesystem_read_size&)
+    mov rax, filesystem_read_size.QuadPart
+    inc rax
+    invoke(arenaPush, arena&, rax, 16)
+    mov rbx, rax                           ; the bytes
+    ; invoke moves 64 bits; LowPart is 32, so it goes straight into r8d.
+    ; (LowPart is in LARGE_INTEGER's anonymous struct, named through it as in C.)
+    mov r8d, filesystem_read_size.LowPart
+    invoke(ReadFile, filesystem_read_file, rbx, r8, filesystem_read_got&, 0)
+    invoke(CloseHandle, filesystem_read_file)
+    mov rax, filesystem_read_size.QuadPart
+    mov byte ptr [rbx + rax], 0
+    test rsi, rsi
+    jz no_size
+    mov [rsi], rax
+  no_size:
+    mov rax, rbx
+  done:
+    add rsp, 56
+    pop rsi
+    pop rbx
+    ret
+}

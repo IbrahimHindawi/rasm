@@ -1,0 +1,184 @@
+; 3.1 Materials
+;
+; The three Phong terms get their own colours, on both sides:
+;
+;   material   how much ambient, diffuse and specular light the surface
+;              reflects, and how tight its highlight is (shininess)
+;   light      how much of each the light gives out
+;
+; Each term is light * material. The light's colour drifts over time, which
+; shows the split: the highlight takes the light's colour, the body takes the
+; product of the two.
+;
+;   W A S D, Space, Shift   move
+;   right mouse + drag      look
+;   wheel                   zoom
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/cube.rasm"
+import "../../../includes/learn/camera.rasm"
+import "../../../includes/learn/transforms.rasm"
+
+; Mirror `cbuffer material` and `cbuffer light` in materials.hlsl.
+material_constants: struct = {
+    ambient: vec3
+    pad0: f32
+    diffuse: vec3
+    pad1: f32
+    specular: vec3
+    shininess: f32
+}
+
+light_constants: struct = {
+    position: vec3
+    pad0: f32
+    ambient: vec3
+    pad1: f32
+    diffuse: vec3
+    pad2: f32
+    specular: vec3
+    pad3: f32
+}
+
+camera_start: const vec3 = { -1.0, 1.0, 4.0 }
+clear_color: [4]const f32 = { 0.1, 0.1, 0.1, 1.0 }
+
+t: transforms = {}
+material: const material_constants = {
+    .ambient = { 1.0, 0.5, 0.31 },
+    .diffuse = { 1.0, 0.5, 0.31 },
+    .specular = { 0.5, 0.5, 0.5 },
+    .shininess = 32.0,
+}
+light: light_constants = {
+    .position = { 1.2, 1.0, 2.0 },
+    .specular = { 1.0, 1.0, 1.0 },
+}                                          ; ambient and diffuse follow the colour, every frame
+lamp_color: vec4 = { 0.0, 0.0, 0.0, 1.0 }
+model: mat4 = {}
+lighting_shader: shader = {}
+lamp_shader: shader = {}
+cam: camera = {}
+cube_vb: *ID3D11Buffer = {}
+transforms_buffer: *ID3D11Buffer = {}
+material_buffer: *ID3D11Buffer = {}
+light_buffer: *ID3D11Buffer = {}
+lamp_buffer: *ID3D11Buffer = {}
+stride: u32 = CUBE_STRIDE
+offset: u32 = 0
+
+; timing
+current_frame: f32 = 0.0
+delta_time: f32 = 0.0
+last_frame: f32 = 0.0
+
+; xmm0: time, xmm1: rate -> xmm0: sin(time * rate) / 2 + 0.5, a colour
+; channel drifting in 0..1
+drift: proc(time: f32, rate: f32) -> f32 = {
+    sub rsp, 40                            ; 32 shadow (sinf's scratch), and rsp back on 16
+    mulss xmm0, xmm1
+    call sinf
+    mulss xmm0, 0.5
+    addss xmm0, 0.5
+    add rsp, 40
+    ret
+}
+
+main: proc() -> i32 = {
+    sub rsp, 56                            ; IASetVertexBuffers: 5 past `this`, 2 on the stack: 32 + 16; entry 8 + 56 lands on 16
+
+    invoke(window_create, "LearnD3D11")
+    call window_create_depth
+
+    invoke(shader_create, lighting_shader&, "src/2.lighting/3.1.materials/materials.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+    invoke(shader_create, lamp_shader&, "src/2.lighting/3.1.materials/light_cube.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, cube_vertices&, sizeof(cube_vertices))
+    mov cube_vb, rax
+    invoke(create_constant_buffer, sizeof(transforms))
+    mov transforms_buffer, rax
+    invoke(create_constant_buffer, sizeof(material_constants))
+    mov material_buffer, rax
+    invoke(create_constant_buffer, sizeof(light_constants))
+    mov light_buffer, rax
+    invoke(create_constant_buffer, sizeof(vec4))
+    mov lamp_buffer, rax
+    ; the material never changes
+    invoke(update_buffer, material_buffer, material&, sizeof(material_constants))
+
+    lea rcx, cam
+    lea rdx, camera_start
+    movss xmm2, -75.0                      ; yaw
+    movss xmm3, -10.0                      ; pitch
+    call camera_create
+
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    call get_time
+    movss current_frame, xmm0
+    movss xmm1, xmm0
+    subss xmm0, last_frame
+    movss delta_time, xmm0
+    movss last_frame, xmm1
+
+    invoke(camera_process_input, cam&, delta_time&)
+
+    invoke(window_begin, clear_color&)
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    vcall(context, ID3D11DeviceContextVtbl.IASetVertexBuffers, 0, 1, cube_vb&, stride&, offset&)
+    invoke(bind_constants, 0, transforms_buffer)
+    invoke(transforms_from_camera, t&, cam&)
+
+    ; the light's colour: each channel drifts at its own rate
+    movss xmm0, current_frame
+    movss xmm1, 2.0
+    call drift
+    movss lamp_color.x, xmm0
+    movss xmm0, current_frame
+    movss xmm1, 0.7
+    call drift
+    movss lamp_color.y, xmm0
+    movss xmm0, current_frame
+    movss xmm1, 1.3
+    call drift
+    movss lamp_color.z, xmm0
+    ; diffuse = colour / 2, ambient = diffuse / 5
+    lea rcx, light.diffuse
+    lea rdx, lamp_color
+    movss xmm2, 0.5
+    call v3_scale
+    lea rcx, light.ambient
+    lea rdx, light.diffuse
+    movss xmm2, 0.2
+    call v3_scale
+    invoke(update_buffer, light_buffer, light&, sizeof(light_constants))
+
+    invoke(shader_use, lighting_shader&)
+    invoke(bind_constants, 1, material_buffer)
+    invoke(bind_constants, 2, light_buffer)
+    lea rcx, model
+    call m4_identity
+    invoke(draw_cube, transforms_buffer, t&, model&)
+
+    invoke(update_buffer, lamp_buffer, lamp_color&, sizeof(vec4))
+    invoke(shader_use, lamp_shader&)
+    invoke(bind_constants, 1, lamp_buffer)
+    lea rcx, model
+    lea rdx, light.position
+    movss xmm2, 0.2                        ; the scale, the third argument
+    call m4_translate_scale
+    invoke(draw_cube, transforms_buffer, t&, model&)
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

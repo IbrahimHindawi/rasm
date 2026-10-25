@@ -1,0 +1,176 @@
+; 4. Normal mapping
+;
+; Lighting depends on the normal, so a flat wall lit with its one flat normal
+; looks flat whatever its texture shows. A normal map stores a normal per
+; texel instead (the bluish image: xyz packed into rgb), so every brick and
+; every mortar groove catches the light on its own.
+;
+; The map's normals are in tangent space: z out of the surface, x along u, y
+; along v. (The files are made for GL, which shows them upside down, so their
+; +y points down the image as they sit, the way v runs.) That keeps one map
+; valid however the surface is turned. The vertex shader builds the three axes
+; in world space, tangent, bitangent and normal (TBN), and the pixel shader
+; turns the map's normal into world space through them before lighting as
+; usual. create_wall (includes/learn/wall.rasm) computes the tangent from how
+; position and uv change along the triangle's edges.
+;
+;   Tab   normal map on / off
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/cube.rasm"
+import "../../../includes/learn/camera.rasm"
+import "../../../includes/learn/transforms.rasm"
+import "../../../includes/learn/srgb.rasm"
+import "../../../includes/learn/wall.rasm"
+
+; Mirrors `cbuffer light` in normal_mapping.hlsl.
+light_constants: struct = {
+    position: vec3
+    use_map: u32
+}
+
+camera_start: const vec3 = { 0.0, 0.0, 3.0 }
+y_axis: const vec3 = { 0.0, 1.0, 0.0 }
+clear_color: [4]const f32 = { 0.1, 0.1, 0.1, 1.0 }
+lamp_color: const vec4 = { 1.0, 1.0, 1.0, 1.0 }
+
+t: transforms = {}
+light: light_constants = { .position = { .z = 0.6 } }   ; z stays; x and y wander
+model: mat4 = {}
+s: shader = {}
+lamp_shader: shader = {}
+cam: camera = {}
+cube_vb: *ID3D11Buffer = {}
+wall_vb: *ID3D11Buffer = {}
+transforms_buffer: *ID3D11Buffer = {}
+light_buffer: *ID3D11Buffer = {}
+lamp_buffer: *ID3D11Buffer = {}
+sampler: *ID3D11SamplerState = {}
+maps: [2]*ID3D11ShaderResourceView = {}
+wall_vertex_stride: u32 = WALL_STRIDE
+wall_offset: u32 = 0
+
+; timing
+current_frame: f32 = 0.0
+delta_time: f32 = 0.0
+last_frame: f32 = 0.0
+
+main: proc() -> i32 = {
+    sub rsp, 56                            ; IASetVertexBuffers takes 6: 32 + 16, draw_vertices 5: 32 + 8; entry 8 + 56 lands on 16
+
+    invoke(window_create, "LearnD3D11  (Tab: normal map on / off)")
+    ; The back buffer is viewed as sRGB: what the shaders write is linear, and
+    ; the view gamma-encodes it on the way in (5.2).
+    call window_use_srgb
+    call window_create_depth
+
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP)
+    mov sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 0, 1, sampler&)
+
+    ; build and compile shaders
+    ; -------------------------
+    invoke(shader_create, s&, "src/5.advanced_lighting/4.normal_mapping/normal_mapping.hlsl", wall_layout&, WALL_LAYOUT_COUNT)
+    invoke(shader_create, lamp_shader&, "src/5.advanced_lighting/4.normal_mapping/light_cube.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+
+    ; set up vertex data and textures
+    ; -------------------------------
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, cube_vertices&, sizeof(cube_vertices))
+    mov cube_vb, rax
+    call create_wall
+    mov wall_vb, rax
+    invoke(create_constant_buffer, sizeof(transforms))
+    mov transforms_buffer, rax
+    invoke(create_constant_buffer, sizeof(light_constants))
+    mov light_buffer, rax
+    invoke(create_constant_buffer, sizeof(vec4))
+    mov lamp_buffer, rax
+    ; the bricks' colours (sRGB) and their normals (data, linear)
+    invoke(filesystem_path, "resources/textures/brickwall.jpg")
+    invoke(load_texture, rax, 1)
+    mov maps[0], rax
+    invoke(filesystem_path, "resources/textures/brickwall_normal.jpg")
+    invoke(load_texture, rax, 0)
+    mov maps[1], rax
+
+    lea rcx, cam
+    lea rdx, camera_start
+    movss xmm2, -90.0                      ; yaw
+    xorps xmm3, xmm3                       ; pitch 0
+    call camera_create
+
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    ; per-frame time logic
+    call get_time
+    movss current_frame, xmm0
+    movss xmm1, xmm0
+    subss xmm0, last_frame
+    movss delta_time, xmm0
+    movss last_frame, xmm1
+
+    invoke(camera_process_input, cam&, delta_time&)
+    ; mode 0 uses the normal map, mode 1 the flat normal
+    invoke(window_mode, 2)
+    mov ecx, 1
+    sub ecx, eax
+    mov light.use_map, ecx
+
+    invoke(window_begin, clear_color&)
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    invoke(bind_constants, 0, transforms_buffer)
+    invoke(transforms_from_camera, t&, cam&)
+
+    ; the light wanders in front of the wall: (0.8 cos t, 0.8 sin 1.3t, 0.6)
+    movss xmm0, current_frame
+    call cosf
+    mulss xmm0, 0.8
+    movss light.position.x, xmm0
+    movss xmm0, current_frame
+    mulss xmm0, 1.3
+    call sinf
+    mulss xmm0, 0.8
+    movss light.position.y, xmm0
+    invoke(update_buffer, light_buffer, light&, sizeof(light_constants))
+    invoke(shader_use, s&)
+    invoke(bind_constants, 1, light_buffer)
+    vcall(context, ID3D11DeviceContextVtbl.PSSetShaderResources, 0, 2, maps&)
+
+    ; the wall turns a little, back and forth: rotate(radians(-25) sin(0.4 t), y)
+    movss xmm0, current_frame
+    mulss xmm0, 0.4
+    call sinf
+    mulss xmm0, -25.0
+    call radians
+    movaps xmm1, xmm0                      ; the angle, the second argument
+    lea rcx, t.model
+    lea r8, y_axis
+    call m4_rotate
+    invoke(m4_normal_matrix, t.normal_matrix&, t.model&)
+    invoke(update_buffer, transforms_buffer, t&, sizeof(transforms))
+    vcall(context, ID3D11DeviceContextVtbl.IASetVertexBuffers, 0, 1, wall_vb&, wall_vertex_stride&, wall_offset&)
+    vcall(context, ID3D11DeviceContextVtbl.Draw, 6, 0)
+
+    ; the lamp
+    invoke(update_buffer, lamp_buffer, lamp_color&, sizeof(vec4))
+    invoke(shader_use, lamp_shader&)
+    invoke(bind_constants, 1, lamp_buffer)
+    lea rcx, model
+    lea rdx, light.position
+    movss xmm2, 0.05
+    call m4_translate_scale
+    invoke(draw_vertices, transforms_buffer, t&, cube_vb, 36, model&)
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

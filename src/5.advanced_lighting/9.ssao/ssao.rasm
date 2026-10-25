@@ -1,0 +1,360 @@
+; 9. SSAO
+;
+; Ambient light is a constant, so creases, corners and the gap under an object
+; get just as much of it as an open floor. Ambient occlusion darkens the places
+; the sky cannot reach; screen-space ambient occlusion estimates that from the
+; G-buffer alone, after the geometry is drawn:
+;
+;   1. geometry pass  positions and normals in view space
+;   2. SSAO pass      for each pixel, 64 random points in a small hemisphere
+;                     around its normal. Each point is projected to the screen
+;                     and compared with the depth stored there: if the G-buffer
+;                     has something in front of it, that point is buried, and
+;                     the pixel is a little occluded
+;   3. blur           the kernel is rotated per pixel by a tiled 4x4 noise
+;                     texture, which trades banding for noise; a 4x4 average
+;                     removes the noise
+;   4. lighting       as 8.1, with the ambient term scaled by the result
+;
+;   Tab   lit with SSAO / SSAO alone / lit without
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/macros.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/cube.rasm"
+import "../../../includes/learn/camera.rasm"
+import "../../../includes/learn/transforms.rasm"
+import "../../../includes/learn/model.rasm"
+import "../../../includes/learn/srgb.rasm"
+
+#define KERNEL_SIZE 64
+
+; Mirror the cbuffers of ssao.hlsl, ssao_lighting.hlsl and ssao_geometry.hlsl.
+ssao_constants: struct = {
+    kernel: [KERNEL_SIZE]vec4              ; points in a hemisphere around +z, in tangent space
+}
+
+lighting_constants: struct = {
+    light_position: vec3                   ; view space
+    mode: u32
+}
+
+surface_constants: struct = {
+    flip_normals: f32
+    pad: [3]f32
+}
+
+camera_start: const vec3 = { 0.0, 2.0, 5.0 }
+room_center: const vec3 = { 0.0, 7.0, 0.0 }
+room_size: const vec3 = { 15.0, 15.0, 15.0 }
+x_axis: const vec3 = { 1.0, 0.0, 0.0 }
+world_light: const vec4 = { 2.0, 4.0, -2.0, 1.0 }
+no_color: [4]const f32 = { 0.0, 0.0, 0.0, 0.0 }
+white: [4]const f32 = { 1.0, 1.0, 1.0, 1.0 }
+black: [4]const f32 = { 0.0, 0.0, 0.0, 1.0 }
+
+t: transforms = {}
+kernel: ssao_constants = {}
+lit: lighting_constants = {}
+surface: surface_constants = {}
+noise_pixels: [16]vec4 = {}
+view_light: vec4 = {}
+room: mat4 = {}
+lying: mat4 = {}
+scratch: mat4 = {}
+geometry_shader: shader = {}
+ssao_shader: shader = {}
+blur_shader: shader = {}
+lighting_shader: shader = {}
+cam: camera = {}
+backpack: model = {}
+positions: render_target = {}
+normals: render_target = {}
+occlusion: render_target = {}
+smoothed: render_target = {}
+g_targets: [2]*ID3D11RenderTargetView = {}     ; the geometry pass draws into these
+g_views: [3]*ID3D11ShaderResourceView = {}     ; the SSAO pass reads these
+l_views: [3]*ID3D11ShaderResourceView = {}     ; and the lighting pass these
+g_depth: *ID3D11DepthStencilView = {}
+noise: *ID3D11ShaderResourceView = {}
+cube_vb: *ID3D11Buffer = {}
+transforms_buffer: *ID3D11Buffer = {}
+ssao_buffer: *ID3D11Buffer = {}
+lighting_buffer: *ID3D11Buffer = {}
+surface_buffer: *ID3D11Buffer = {}
+sampler: *ID3D11SamplerState = {}
+
+; the noise as a 4x4 float texture. masm64-dx11 filled these locals of main at
+; run time; all of it is known before, the address of the pixels included.
+noise_desc: D3D11_TEXTURE2D_DESC = {
+    .Width = 4,
+    .Height = 4,
+    .MipLevels = 1,
+    .ArraySize = 1,
+    .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32B32A32_FLOAT,
+    .SampleDesc = { .Count = 1 },
+    .BindFlags = D3D11_BIND_FLAG.D3D11_BIND_SHADER_RESOURCE,
+}
+noise_init: D3D11_SUBRESOURCE_DATA = {
+    .pSysMem = noise_pixels&,
+    .SysMemPitch = 64,                     ; a row: 4 * sizeof(vec4)
+}
+noise_texture: *ID3D11Texture2D = {}
+
+; timing
+delta_time: f32 = 0.0
+last_frame: f32 = 0.0
+
+; -> xmm0: (rand() % 10000) / 10000, in 0..1
+random01: proc() -> f32 = {
+    sub rsp, 40                            ; 32 shadow, and rsp back on 16
+    call rand
+    xor edx, edx
+    mov ecx, 10000
+    div ecx
+    cvtsi2ss xmm0, edx
+    divss xmm0, 10000.0
+    add rsp, 40
+    ret
+}
+
+; -> xmm0: random01() * 2 - 1, in -1..1
+random_signed: proc() -> f32 = {
+    sub rsp, 40                            ; 32 shadow, and rsp back on 16
+    call random01
+    addss xmm0, xmm0
+    subss xmm0, 1.0
+    add rsp, 40
+    ret
+}
+
+; make_samples's (MASM's `local`s)
+make_samples_p: vec3 = {}
+make_samples_k: f32 = 0.0
+
+; Fills the kernel and the noise. The rin original draws v3(random(),
+; random(), random()), whose arguments its compiler (clang-cl, like MSVC)
+; evaluates right to left, so z comes first; the same order here gives the
+; same points.
+make_samples: proc() = {
+    push rbx
+    push rsi
+    sub rsp, 40                            ; 32 shadow; entry 8 + two pushes 16 + 40 lands on 16
+    ; generate sample kernel: more points close to the centre, where occlusion matters
+    ; --------------------------------------------------------------------------------
+    invoke(srand, 3)
+    lea rsi, kernel.kernel
+    xor ebx, ebx
+  points:
+    call random01
+    movss make_samples_p.z, xmm0
+    call random_signed
+    movss make_samples_p.y, xmm0
+    call random_signed
+    movss make_samples_p.x, xmm0
+    lea rcx, make_samples_p
+    mov rdx, rcx
+    call v3_normalize
+    ; scale = i / 64, then p *= random01() * lerp(0.1, 1, scale^2)
+    cvtsi2ss xmm0, ebx
+    divss xmm0, 64.0
+    mulss xmm0, xmm0
+    mulss xmm0, 0.9
+    addss xmm0, 0.1
+    movss make_samples_k, xmm0
+    call random01
+    mulss xmm0, make_samples_k
+    movaps xmm2, xmm0                      ; v3_scale's factor, its third argument
+    mov rcx, rsi
+    lea rdx, make_samples_p
+    call v3_scale
+    mov [rsi].vec4.w, 0
+    add rsi, sizeof(vec4)
+    inc ebx
+    cmp ebx, KERNEL_SIZE
+    jb points
+
+    ; generate noise texture: sixteen random rotations about z, tiled over the screen
+    ; -------------------------------------------------------------------------------
+    lea rsi, noise_pixels
+    xor ebx, ebx
+  rotations:
+    call random_signed
+    movss [rsi].vec4.y, xmm0
+    call random_signed
+    movss [rsi].vec4.x, xmm0
+    mov [rsi].vec4.z, 0
+    mov [rsi].vec4.w, 0
+    add rsi, sizeof(vec4)
+    inc ebx
+    cmp ebx, 16
+    jb rotations
+    add rsp, 40
+    pop rsi
+    pop rbx
+    ret
+}
+
+main: proc() -> i32 = {
+    sub rsp, 40                            ; 5-argument calls (draw_vertices, create_render_target): 32 + 8, and 8 + 40 lands on 16
+
+    invoke(window_create, "LearnD3D11  (Tab: lit with ssao / ssao / lit without)")
+    ; The back buffer is viewed as sRGB: what the shaders write is linear, and
+    ; the view gamma-encodes it on the way in (5.2).
+    call window_use_srgb
+    call window_create_depth
+
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP)
+    mov sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 0, 1, sampler&)
+
+    ; build and compile shaders
+    ; -------------------------
+    invoke(shader_create, geometry_shader&, "src/5.advanced_lighting/9.ssao/ssao_geometry.hlsl", model_layout&, MODEL_LAYOUT_COUNT)
+    invoke(shader_create, ssao_shader&, "src/5.advanced_lighting/9.ssao/ssao.hlsl", 0, 0)
+    invoke(shader_create, blur_shader&, "src/5.advanced_lighting/9.ssao/ssao_blur.hlsl", 0, 0)
+    invoke(shader_create, lighting_shader&, "src/5.advanced_lighting/9.ssao/ssao_lighting.hlsl", 0, 0)
+
+    ; load models
+    ; -----------
+    invoke(model_load, backpack&, "resources/objects/backpack/", "backpack.obj", 0)
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, cube_vertices&, sizeof(cube_vertices))
+    mov cube_vb, rax
+    invoke(create_constant_buffer, sizeof(transforms))
+    mov transforms_buffer, rax
+    invoke(create_constant_buffer, sizeof(ssao_constants))
+    mov ssao_buffer, rax
+    invoke(create_constant_buffer, sizeof(lighting_constants))
+    mov lighting_buffer, rax
+    invoke(create_constant_buffer, sizeof(surface_constants))
+    mov surface_buffer, rax
+
+    lea rcx, cam
+    lea rdx, camera_start
+    movss xmm2, -90.0                      ; yaw
+    movss xmm3, -15.0                      ; pitch
+    call camera_create
+
+    ; configure g-buffer and ssao framebuffers
+    ; ----------------------------------------
+    invoke(create_render_target, positions&, SCR_WIDTH, SCR_HEIGHT, DXGI_FORMAT.DXGI_FORMAT_R16G16B16A16_FLOAT, 1)
+    invoke(create_render_target, normals&, SCR_WIDTH, SCR_HEIGHT, DXGI_FORMAT.DXGI_FORMAT_R16G16B16A16_FLOAT, 1)
+    invoke(create_render_target, occlusion&, SCR_WIDTH, SCR_HEIGHT, DXGI_FORMAT.DXGI_FORMAT_R16_FLOAT, 1)
+    invoke(create_render_target, smoothed&, SCR_WIDTH, SCR_HEIGHT, DXGI_FORMAT.DXGI_FORMAT_R16_FLOAT, 1)
+    invoke(create_depth_buffer, SCR_WIDTH, SCR_HEIGHT, 1)
+    mov g_depth, rax
+
+    call make_samples
+    invoke(update_buffer, ssao_buffer, kernel&, sizeof(ssao_constants))
+    vcall(device, ID3D11DeviceVtbl.CreateTexture2D, noise_desc&, noise_init&, noise_texture&)
+    assert_hr()
+    vcall(device, ID3D11DeviceVtbl.CreateShaderResourceView, noise_texture, 0, noise&)
+
+    ; the views each pass binds
+    mov rax, positions.rtv
+    mov g_targets[0], rax
+    mov rax, normals.rtv
+    mov g_targets[1], rax
+    mov rax, positions.srv
+    mov g_views[0], rax
+    mov l_views[0], rax
+    mov rax, normals.srv
+    mov g_views[1], rax
+    mov l_views[1], rax
+    mov rax, noise
+    mov g_views[2], rax
+    mov rax, smoothed.srv
+    mov l_views[2], rax
+
+    ; the room: a big cube seen from inside; the backpack: lying on its back
+    invoke(m4_translate, room&, room_center&)
+    invoke(m4_scale, scratch&, room_size&)
+    invoke(m4_mul, room&, room&, scratch&)
+    movss xmm0, -90.0
+    call radians
+    movaps xmm1, xmm0                      ; the angle, the second argument
+    lea rcx, lying
+    lea r8, x_axis
+    call m4_rotate
+
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    call get_time
+    movss xmm1, xmm0
+    subss xmm0, last_frame
+    movss delta_time, xmm0
+    movss last_frame, xmm1
+
+    invoke(camera_process_input, cam&, delta_time&)
+    invoke(window_mode, 3)
+    mov lit.mode, eax
+
+    ; 1. geometry pass: render scene's geometry/colour data into the g-buffer
+    ; -----------------------------------------------------------------------
+    call unbind_textures
+    vcall(context, ID3D11DeviceContextVtbl.OMSetRenderTargets, 2, g_targets&, g_depth)
+    vcall(context, ID3D11DeviceContextVtbl.ClearRenderTargetView, positions.rtv, no_color&)
+    vcall(context, ID3D11DeviceContextVtbl.ClearRenderTargetView, normals.rtv, no_color&)
+    movss xmm3, 1.0                        ; the depth, a float: xmm3
+    vcall(context, ID3D11DeviceContextVtbl.ClearDepthStencilView, g_depth, D3D11_CLEAR_FLAG.D3D11_CLEAR_DEPTH, 0, 0)
+    vcall(context, ID3D11DeviceContextVtbl.RSSetViewports, 1, viewport&)
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    invoke(bind_constants, 0, transforms_buffer)
+    invoke(transforms_from_camera, t&, cam&)
+    invoke(shader_use, geometry_shader&)
+    invoke(bind_constants, 1, surface_buffer)
+    mov surface.flip_normals, 0xBF800000   ; -1.0: the room is seen from inside
+    invoke(update_buffer, surface_buffer, surface&, sizeof(surface_constants))
+    invoke(draw_vertices, transforms_buffer, t&, cube_vb, 36, room&)
+    mov surface.flip_normals, 0x3F800000   ; 1.0
+    invoke(update_buffer, surface_buffer, surface&, sizeof(surface_constants))
+    lea rcx, t.model
+    lea rdx, lying
+    m4_copy(rcx, rdx)
+    invoke(m4_normal_matrix, t.normal_matrix&, lying&)
+    invoke(update_buffer, transforms_buffer, t&, sizeof(transforms))
+    invoke(model_draw, backpack&)
+
+    ; 2. generate SSAO texture
+    ; ------------------------
+    call unbind_textures
+    vcall(context, ID3D11DeviceContextVtbl.OMSetRenderTargets, 1, occlusion.rtv&, 0)
+    vcall(context, ID3D11DeviceContextVtbl.ClearRenderTargetView, occlusion.rtv, white&)
+    invoke(shader_use, ssao_shader&)
+    invoke(bind_constants, 1, ssao_buffer)
+    vcall(context, ID3D11DeviceContextVtbl.PSSetShaderResources, 0, 3, g_views&)
+    vcall(context, ID3D11DeviceContextVtbl.Draw, 3, 0)
+
+    ; 3. blur SSAO texture to remove noise
+    ; ------------------------------------
+    call unbind_textures
+    vcall(context, ID3D11DeviceContextVtbl.OMSetRenderTargets, 1, smoothed.rtv&, 0)
+    invoke(shader_use, blur_shader&)
+    invoke(bind_texture, 0, occlusion.srv)
+    vcall(context, ID3D11DeviceContextVtbl.Draw, 3, 0)
+
+    ; 4. lighting pass: Blinn-Phong in view space, ambient scaled by the occlusion
+    ; ----------------------------------------------------------------------------
+    call unbind_textures
+    invoke(window_begin, black&)
+    invoke(m4_mul_v4, view_light&, t.view&, world_light&)
+    v3load_var(xmm0, view_light)
+    v3store_var(lit.light_position, xmm0)
+    invoke(update_buffer, lighting_buffer, lit&, sizeof(lighting_constants))
+    invoke(shader_use, lighting_shader&)
+    invoke(bind_constants, 1, lighting_buffer)
+    vcall(context, ID3D11DeviceContextVtbl.PSSetShaderResources, 0, 3, l_views&)
+    vcall(context, ID3D11DeviceContextVtbl.Draw, 3, 0)
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

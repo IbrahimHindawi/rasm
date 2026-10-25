@@ -1,0 +1,275 @@
+; 3.1 Shadow mapping
+;
+; A point is in shadow if something nearer to the light covers it. So: draw
+; the scene once from the light, keeping only depth. That depth texture, the
+; shadow map, records the nearest surface the light sees in every direction.
+; Then draw normally, and for each pixel ask: transformed into the light's
+; view, is this point farther than what the map recorded? Then it is behind
+; something, and only ambient light reaches it.
+;
+; The sun is directional, so its view uses an orthographic projection: a box
+; around the scene rather than a frustum.
+;
+; What D3D does for us here:
+;
+;   * the shadow map is one typeless texture seen two ways: as a depth buffer
+;     while it is drawn, as a float texture while it is read
+;     (includes/learn/shadow.rasm)
+;   * shadow acne, a surface shadowing itself because the map's texels are
+;     coarser than the screen's, is fixed by the rasterizer's slope-scaled
+;     depth bias during the shadow pass, not by a constant in the shader
+;   * the comparison sampler does the depth test and blends four texels of
+;     results inside SampleCmp; 3x3 of those give soft edges (PCF)
+;
+;   Tab   the scene / the shadow map itself
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/cube.rasm"
+import "../../../includes/learn/camera.rasm"
+import "../../../includes/learn/transforms.rasm"
+import "../../../includes/learn/shadow.rasm"
+import "../../../includes/learn/srgb.rasm"
+
+plane_vertices: [48]const f32 = {            ; 6 vertices of 8 floats
+    ; position             normal             uv
+    -12.5, -0.5,  12.5,   0.0, 1.0, 0.0,    0.0, 12.0,
+     12.5, -0.5,  12.5,   0.0, 1.0, 0.0,   12.0, 12.0,
+     12.5, -0.5, -12.5,   0.0, 1.0, 0.0,   12.0,  0.0,
+    -12.5, -0.5,  12.5,   0.0, 1.0, 0.0,    0.0, 12.0,
+     12.5, -0.5, -12.5,   0.0, 1.0, 0.0,   12.0,  0.0,
+    -12.5, -0.5, -12.5,   0.0, 1.0, 0.0,    0.0,  0.0,
+}
+
+; Mirrors `cbuffer shadow` in shadow_mapping.hlsl.
+shadow_constants: struct = {
+    light_space: mat4
+    light_direction: vec3                  ; where the sunlight travels
+    pad: f32
+}
+
+#define SHADOW_SIZE 2048
+
+camera_start: const vec3 = { -2.5, 3.0, 6.5 }
+origin: const vec3 = { 0.0, 0.0, 0.0 }
+up_axis: const vec3 = { 0.0, 1.0, 0.0 }
+tilt_axis: const vec3 = { 1.0, 0.0, 1.0 }
+cube_place_a: const vec3 = { 0.0, 1.5, 0.0 }
+cube_place_b: const vec3 = { 2.0, 0.0, 1.0 }
+cube_place_c: const vec3 = { -1.0, 0.0, 2.0 }
+half_size: const vec3 = { 0.5, 0.5, 0.5 }
+clear_color: [4]const f32 = { 0.1, 0.1, 0.1, 1.0 }
+light_position: vec3 = { .y = 8.0 }        ; y stays; x and z circle
+
+t: transforms = {}
+sh: shadow_constants = {}
+cubes: [3]mat4 = {}
+light_view: mat4 = {}
+light_projection: mat4 = {}
+model: mat4 = {}
+scratch: mat4 = {}
+s: shader = {}
+depth_shader: shader = {}
+debug_shader: shader = {}
+cam: camera = {}
+depth_map: shadow_map = {}
+cube_vb: *ID3D11Buffer = {}
+plane_vb: *ID3D11Buffer = {}
+transforms_buffer: *ID3D11Buffer = {}
+shadow_buffer: *ID3D11Buffer = {}
+wood: *ID3D11ShaderResourceView = {}
+sampler: *ID3D11SamplerState = {}
+compare_sampler: *ID3D11SamplerState = {}
+bias_state: *ID3D11RasterizerState = {}
+
+; timing
+current_frame: f32 = 0.0
+delta_time: f32 = 0.0
+last_frame: f32 = 0.0
+
+; The floor and the three cubes, with whatever shader and view are bound.
+draw_scene: proc() = {
+    push rbx
+    push rsi
+    sub rsp, 40                            ; draw_vertices takes 5: 32 + 8; entry 8 + two pushes 16 + 40 lands on 16
+    invoke(m4_identity, model&)
+    invoke(draw_vertices, transforms_buffer, t&, plane_vb, 6, model&)
+    lea rsi, cubes
+    xor ebx, ebx
+  each_cube:
+    invoke(draw_vertices, transforms_buffer, t&, cube_vb, 36, rsi)
+    add rsi, sizeof(mat4)
+    inc ebx
+    cmp ebx, 3
+    jb each_cube
+    add rsp, 40
+    pop rsi
+    pop rbx
+    ret
+}
+
+main: proc() -> i32 = {
+    push rbx
+    sub rsp, 64                            ; m4_ortho takes 7: 32 + 24; entry 8 + push 8 + 64 lands on 16
+
+    invoke(window_create, "LearnD3D11  (Tab: scene / shadow map)")
+    ; The back buffer is viewed as sRGB: what the shaders write is linear, and
+    ; the view gamma-encodes it on the way in (5.2).
+    call window_use_srgb
+    call window_create_depth
+
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP)
+    mov sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 0, 1, sampler&)
+
+    ; The shadow pass's rasterizer: push depth away from the light, more on
+    ; slopes seen at a grazing angle.
+    call shadow_bias_state
+    mov bias_state, rax
+
+    ; build and compile shaders
+    ; -------------------------
+    invoke(shader_create, s&, "src/5.advanced_lighting/3.1.shadow_mapping/shadow_mapping.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+    invoke(shader_create, depth_shader&, "src/5.advanced_lighting/3.1.shadow_mapping/shadow_mapping_depth.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+    invoke(shader_create, debug_shader&, "src/5.advanced_lighting/3.1.shadow_mapping/debug_quad.hlsl", 0, 0)
+
+    ; set up vertex data and textures
+    ; -------------------------------
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, cube_vertices&, sizeof(cube_vertices))
+    mov cube_vb, rax
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, plane_vertices&, sizeof(plane_vertices))
+    mov plane_vb, rax
+    invoke(create_constant_buffer, sizeof(transforms))
+    mov transforms_buffer, rax
+    invoke(create_constant_buffer, sizeof(shadow_constants))
+    mov shadow_buffer, rax
+    invoke(filesystem_path, "resources/textures/wood.png")
+    invoke(load_texture, rax, 1)
+    mov wood, rax
+    invoke(create_shadow_map, depth_map&, SHADOW_SIZE)
+    call create_shadow_sampler
+    mov compare_sampler, rax
+
+    lea rcx, cam
+    lea rdx, camera_start
+    movss xmm2, -65.0                      ; yaw
+    movss xmm3, -25.0                      ; pitch
+    call camera_create
+
+    ; three cubes: one floating, one on the floor, one small and tilted
+    invoke(m4_translate, cubes[0]&, cube_place_a&)
+    invoke(m4_translate, cubes[1]&, cube_place_b&)
+    invoke(m4_scale, scratch&, half_size&)
+    movss xmm0, 60.0
+    call radians
+    movaps xmm1, xmm0                      ; the angle, the second argument
+    lea rcx, model
+    lea r8, tilt_axis
+    call m4_rotate
+    invoke(m4_mul, scratch&, model&, scratch&)
+    invoke(m4_translate, model&, cube_place_c&)
+    invoke(m4_mul, cubes[2]&, model&, scratch&)
+
+    ; The sun's view never changes shape: a 20 x 20 box, 1 to 20 units from it.
+    movss xmm0, 10.0
+    movss dword ptr [rsp + 32], xmm0       ; top
+    movss xmm0, 1.0
+    movss dword ptr [rsp + 40], xmm0       ; z_near
+    movss xmm0, 20.0
+    movss dword ptr [rsp + 48], xmm0       ; z_far
+    lea rcx, light_projection
+    movss xmm1, -10.0                      ; left
+    movss xmm2, 10.0                       ; right
+    movss xmm3, -10.0                      ; bottom
+    call m4_ortho
+
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    ; per-frame time logic
+    call get_time
+    movss current_frame, xmm0
+    movss xmm1, xmm0
+    subss xmm0, last_frame
+    movss delta_time, xmm0
+    movss last_frame, xmm1
+
+    invoke(camera_process_input, cam&, delta_time&)
+    invoke(window_mode, 2)
+    mov ebx, eax                           ; 1: show the shadow map
+
+    ; the sun circles slowly, so the shadows sweep across the floor:
+    ; (-4 cos(0.3 t), 8, -2 - 2 sin(0.3 t))
+    movss xmm0, current_frame
+    mulss xmm0, 0.3
+    call cosf
+    mulss xmm0, -4.0
+    movss light_position.x, xmm0
+    movss xmm0, current_frame
+    mulss xmm0, 0.3
+    call sinf
+    mulss xmm0, -2.0
+    addss xmm0, -2.0
+    movss light_position.z, xmm0
+    invoke(m4_look_at, light_view&, light_position&, origin&, up_axis&)
+    invoke(m4_mul, sh.light_space&, light_projection&, light_view&)
+    ; light_direction = normalize(-light_position)
+    lea rcx, sh.light_direction
+    lea rdx, light_position
+    movss xmm2, -1.0
+    call v3_scale
+    lea rcx, sh.light_direction
+    mov rdx, rcx
+    call v3_normalize
+    invoke(update_buffer, shadow_buffer, sh&, sizeof(shadow_constants))
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    invoke(bind_constants, 0, transforms_buffer)
+
+    ; 1. render depth of scene to texture (from light's perspective)
+    ; --------------------------------------------------------------
+    call unbind_textures
+    vcall(context, ID3D11DeviceContextVtbl.OMSetRenderTargets, 0, 0, depth_map.dsv)
+    movss xmm3, 1.0                        ; the depth, a float: xmm3
+    vcall(context, ID3D11DeviceContextVtbl.ClearDepthStencilView, depth_map.dsv, D3D11_CLEAR_FLAG.D3D11_CLEAR_DEPTH, 0, 0)
+    invoke(set_viewport, SHADOW_SIZE, SHADOW_SIZE)
+    vcall(context, ID3D11DeviceContextVtbl.RSSetState, bias_state)
+    lea rax, t.view
+    lea rcx, light_view
+    m4_copy(rax, rcx)
+    lea rax, t.projection
+    lea rcx, light_projection
+    m4_copy(rax, rcx)
+    invoke(shader_use, depth_shader&)
+    call draw_scene
+    vcall(context, ID3D11DeviceContextVtbl.RSSetState, raster_state)
+
+    ; 2. render scene as normal using the generated depth/shadow map
+    ; --------------------------------------------------------------
+    invoke(window_begin, clear_color&)
+    test ebx, ebx
+    jz scene
+    invoke(shader_use, debug_shader&)
+    invoke(bind_texture, 0, depth_map.srv)
+    vcall(context, ID3D11DeviceContextVtbl.Draw, 3, 0)
+    jmp drawn
+  scene:
+    invoke(transforms_from_camera, t&, cam&)
+    invoke(shader_use, s&)
+    invoke(bind_constants, 1, shadow_buffer)
+    invoke(bind_texture, 0, wood)
+    invoke(bind_texture, 1, depth_map.srv)
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 1, 1, compare_sampler&)
+    call draw_scene
+  drawn:
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

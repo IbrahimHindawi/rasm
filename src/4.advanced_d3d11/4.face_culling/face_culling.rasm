@@ -1,0 +1,158 @@
+; 4. Face culling
+;
+; A closed object's back faces can never be seen: something in front always
+; covers them. So the rasterizer can skip them before any pixel is shaded,
+; roughly halving the work for a cube.
+;
+; Which side is the front comes from the winding, the order the corners appear
+; in on screen. Every vertex array here is counter-clockwise from outside, and
+; the rasterizer is told so (FrontCounterClockwise); a triangle seen from
+; behind then comes out clockwise, and is culled.
+;
+; Culling front faces leaves the insides of the cubes: you see through the
+; near walls to the far ones.
+;
+;   Tab   none / cull back faces / cull front faces
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/cube.rasm"
+import "../../../includes/learn/camera.rasm"
+import "../../../includes/learn/transforms.rasm"
+
+plane_vertices: [48]const f32 = {
+    ; position             normal              uv
+    -5.0, -0.5,  5.0,     0.0, 1.0, 0.0,     0.0, 2.0,
+     5.0, -0.5,  5.0,     0.0, 1.0, 0.0,     2.0, 2.0,
+     5.0, -0.5, -5.0,     0.0, 1.0, 0.0,     2.0, 0.0,
+    -5.0, -0.5,  5.0,     0.0, 1.0, 0.0,     0.0, 2.0,
+     5.0, -0.5, -5.0,     0.0, 1.0, 0.0,     2.0, 0.0,
+    -5.0, -0.5, -5.0,     0.0, 1.0, 0.0,     0.0, 0.0,
+}
+
+camera_start: const vec3 = { -1.0, 1.0, 4.0 }
+cube_a: const vec3 = { -1.0, 0.0, -1.0 }
+cube_b: const vec3 = { 2.0, 0.0, 0.0 }
+clear_color: [4]const f32 = { 0.1, 0.1, 0.1, 1.0 }
+cull_modes: [3]const D3D11_CULL_MODE = {
+    D3D11_CULL_MODE.D3D11_CULL_NONE,
+    D3D11_CULL_MODE.D3D11_CULL_BACK,
+    D3D11_CULL_MODE.D3D11_CULL_FRONT,
+}
+
+; window.rasm's rasterizer state, with CullMode filled in for each of cull_modes
+raster_desc: D3D11_RASTERIZER_DESC = {
+    .FillMode = D3D11_FILL_MODE.D3D11_FILL_SOLID,
+    .FrontCounterClockwise = 1,
+    .DepthClipEnable = 1,
+}
+
+t: transforms = {}
+model: mat4 = {}
+s: shader = {}
+cam: camera = {}
+cull_states: [3]*ID3D11RasterizerState = {}   ; one for each of cull_modes
+cube_vb: *ID3D11Buffer = {}
+plane_vb: *ID3D11Buffer = {}
+transforms_buffer: *ID3D11Buffer = {}
+cube_texture: *ID3D11ShaderResourceView = {}
+floor_texture: *ID3D11ShaderResourceView = {}
+sampler: *ID3D11SamplerState = {}
+
+; timing
+delta_time: f32 = 0.0
+last_frame: f32 = 0.0
+
+main: proc() -> i32 = {
+    push rbx
+    push rsi
+    push rdi
+    sub rsp, 48                            ; draw_vertices takes 5: 32 + 8, and 8 more: entry 8 + three pushes 24 + 48 lands on 16
+
+    invoke(window_create, "LearnD3D11")
+    call window_create_depth
+    invoke(window_mode_default, 2)
+
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP)
+    mov sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 0, 1, sampler&)
+
+    ; the three rasterizer states
+    lea rsi, cull_modes
+    lea rdi, cull_states
+    xor ebx, ebx
+  states:
+    mov eax, [rsi + rbx * 4]
+    mov raster_desc.CullMode, eax
+    lea rax, [rdi + rbx * 8]
+    vcall(device, ID3D11DeviceVtbl.CreateRasterizerState, raster_desc&, rax)
+    inc ebx
+    cmp ebx, 3
+    jb states
+
+    invoke(shader_create, s&, "src/4.advanced_d3d11/4.face_culling/face_culling.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, cube_vertices&, sizeof(cube_vertices))
+    mov cube_vb, rax
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, plane_vertices&, sizeof(plane_vertices))
+    mov plane_vb, rax
+    invoke(create_constant_buffer, sizeof(transforms))
+    mov transforms_buffer, rax
+    invoke(filesystem_path, "resources/textures/marble.jpg")
+    invoke(load_texture, rax, 0)
+    mov cube_texture, rax
+    invoke(filesystem_path, "resources/textures/metal.png")
+    invoke(load_texture, rax, 0)
+    mov floor_texture, rax
+
+    lea rcx, cam
+    lea rdx, camera_start
+    movss xmm2, -75.0                      ; yaw
+    movss xmm3, -15.0                      ; pitch
+    call camera_create
+
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    call get_time
+    movss xmm1, xmm0
+    subss xmm0, last_frame
+    movss delta_time, xmm0
+    movss last_frame, xmm1
+
+    invoke(camera_process_input, cam&, delta_time&)
+    invoke(window_mode, 3)
+    mov ebx, eax
+
+    invoke(window_begin, clear_color&)
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    invoke(bind_constants, 0, transforms_buffer)
+    invoke(transforms_from_camera, t&, cam&)
+    invoke(shader_use, s&)
+
+    invoke(bind_texture, 0, floor_texture)
+    invoke(m4_identity, model&)
+    invoke(draw_vertices, transforms_buffer, t&, plane_vb, 6, model&)
+
+    ; the cubes with this mode's culling
+    lea rax, cull_states
+    mov rax, [rax + rbx * 8]
+    vcall(context, ID3D11DeviceContextVtbl.RSSetState, rax)
+    invoke(bind_texture, 0, cube_texture)
+    invoke(m4_translate, model&, cube_a&)
+    invoke(draw_vertices, transforms_buffer, t&, cube_vb, 36, model&)
+    invoke(m4_translate, model&, cube_b&)
+    invoke(draw_vertices, transforms_buffer, t&, cube_vb, 36, model&)
+    vcall(context, ID3D11DeviceContextVtbl.RSSetState, raster_state)
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

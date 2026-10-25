@@ -1,0 +1,661 @@
+; window: what GLFW is to LearnOpenGL
+;
+; A window, a D3D11 device and its swap chain, keyboard and mouse input, and a
+; clock. Lessons 1.1 and 2.1 do all of this by hand; from 3.1 on it lives
+; here, and lessons start with
+;
+;     invoke(window_create, "LearnD3D11")
+;   render_loop:
+;     call window_poll                   ; rax = 0 once the window is closed
+;     ...
+;     call window_present
+;
+; Globals the lessons use: `window`, `device`, `context`, `swap_chain`,
+; `backbuffer_rtv`, `raster_state`, `viewport`, `scr_width` and `scr_height`
+; (and SCR_WIDTH, SCR_HEIGHT for initialisers), and once window_create_depth
+; has made them, `depth_texture` and `depth_dsv`.
+;
+; For checking a lesson without a person at the keyboard:
+;
+;     lesson.exe --shot out.png [--time t] [--mode n]
+;
+; renders a few frames with the clock stopped at t seconds (1 by default), in
+; mode n, saves the backbuffer as a PNG and exits. The window stays hidden.
+
+import "../d3d11.rin"
+import "../calls.rasm"
+import "../macros.rasm"
+import "../cstr.rasm"
+import "../print.rasm"
+
+; settings: a fixed size, so the swap chain and every render target keep the
+; size they were created with and nothing needs rebuilding on resize
+#define SCR_WIDTH 1280
+#define SCR_HEIGHT 720
+#define WINDOW_STYLE (WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX))
+; windows.h spells this MAKEINTRESOURCE(32512), a call-shaped macro rasm
+; cannot evaluate, so the number is written here; C keeps the header's.
+#define IDC_ARROW 32512
+
+; The same numbers with storage, for code that reads them (cvtsi2ss xmm0,
+; scr_width). An initialiser takes the #define: C does not accept a const
+; variable there.
+scr_width: const u32 = SCR_WIDTH
+scr_height: const u32 = SCR_HEIGHT
+
+window: HWND = {}
+device: *ID3D11Device = {}                 ; makes resources
+context: *ID3D11DeviceContext = {}         ; records drawing
+swap_chain: *IDXGISwapChain = {}           ; the images shown in turn
+backbuffer: *ID3D11Texture2D = {}
+backbuffer_rtv: *ID3D11RenderTargetView = {}
+raster_state: *ID3D11RasterizerState = {}  ; GL's conventions
+depth_texture: *ID3D11Texture2D = {}       ; from window_create_depth
+depth_dsv: *ID3D11DepthStencilView = {}
+viewport: D3D11_VIEWPORT = {               ; the whole window
+    .Width = cast(SCR_WIDTH, f32),
+    .Height = cast(SCR_HEIGHT, f32),
+    .MaxDepth = 1.0,
+}
+
+; input
+window_keys_pressed: [256]u8 = {}          ; keys pressed since they were last read, for toggles
+window_scroll: f32 = 0.0                   ; wheel notches since the last frame
+window_mouse_dx: f32 = 0.0                 ; cursor movement over the last frame, in pixels
+window_mouse_dy: f32 = 0.0                 ; (up is positive)
+window_last_cursor: POINT = {}
+window_mode_value: u32 = 0
+window_mode_given: b32 = 0                 ; did --mode pick it?
+
+; clock
+window_perf_frequency: i64 = 0
+window_perf_start: i64 = 0
+window_time_now: i64 = 0                   ; get_time's
+
+; --shot
+window_frame: u32 = 0
+window_shot_time: f32 = 1.0
+window_shot_path: [260]u8 = {}
+
+; window_create's. What is known now is written now; the rest is stored by
+; window_create.
+window_create_wc: WNDCLASSEXA = {
+    .cbSize = sizeof(WNDCLASSEXA),
+    .lpfnWndProc = window_proc&,
+    .lpszClassName = "LearnD3D11Rasm",
+}
+window_create_rect: RECT = { .right = SCR_WIDTH, .bottom = SCR_HEIGHT }
+window_create_style: u32 = WINDOW_STYLE
+window_create_swap_desc: DXGI_SWAP_CHAIN_DESC = {
+    .BufferDesc = {
+        .Width = SCR_WIDTH,
+        .Height = SCR_HEIGHT,
+        .Format = DXGI_FORMAT.DXGI_FORMAT_R8G8B8A8_UNORM,
+    },
+    .SampleDesc = { .Count = 1 },
+    .BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    .BufferCount = 2,
+    .Windowed = 1,
+    .SwapEffect = DXGI_SWAP_EFFECT.DXGI_SWAP_EFFECT_FLIP_DISCARD,
+}
+window_create_feature_level: D3D_FEATURE_LEVEL = D3D_FEATURE_LEVEL.D3D_FEATURE_LEVEL_11_0
+; GL's conventions rather than D3D's: counter-clockwise triangles face the
+; viewer, and nothing is culled.
+window_create_raster_desc: D3D11_RASTERIZER_DESC = {
+    .FillMode = D3D11_FILL_MODE.D3D11_FILL_SOLID,
+    .CullMode = D3D11_CULL_MODE.D3D11_CULL_NONE,
+    .FrontCounterClockwise = 1,
+    .DepthClipEnable = 1,
+}
+
+; window_create_depth's: 24 bits of depth, 8 of stencil, the window's size
+window_depth_desc: D3D11_TEXTURE2D_DESC = {
+    .Width = SCR_WIDTH,
+    .Height = SCR_HEIGHT,
+    .MipLevels = 1,
+    .ArraySize = 1,
+    .Format = DXGI_FORMAT.DXGI_FORMAT_D24_UNORM_S8_UINT,
+    .SampleDesc = { .Count = 1 },
+    .BindFlags = D3D11_BIND_FLAG.D3D11_BIND_DEPTH_STENCIL,
+}
+
+; window_poll's
+window_msg: MSG = {}
+window_cursor: POINT = {}
+window_running: b32 = 1
+
+; window_capture's
+window_capture_desc: D3D11_TEXTURE2D_DESC = {}
+window_capture_staging: *ID3D11Texture2D = {}
+window_capture_mapped: D3D11_MAPPED_SUBRESOURCE = {}
+window_capture_pixels: *u8 = {}
+window_capture_wic: *IWICImagingFactory = {}
+window_capture_stream: *IWICStream = {}
+window_capture_encoder: *IWICBitmapEncoder = {}
+window_capture_frame: *IWICBitmapFrameEncode = {}
+window_capture_props: *IPropertyBag2 = {}
+window_capture_wide: [260]u16 = {}
+window_capture_format: GUID = {}           ; SetPixelFormat may change it, so a copy
+
+; win32: every event for the window (keys, mouse, closing) arrives here
+; ---------------------------------------------------------------------
+; The parameters stay in their registers: rcx hwnd, edx msg, r8 wparam, r9
+; lparam. Anything not handled goes to DefWindowProcA with all four still in
+; place, so that call is a jump.
+window_proc: proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> LRESULT = {
+    cmp edx, WM_DESTROY
+    je on_destroy
+    cmp edx, WM_KEYDOWN
+    je on_key
+    cmp edx, WM_MOUSEWHEEL
+    je on_wheel
+    jmp DefWindowProcA
+
+  on_destroy:
+    sub rsp, 40                            ; shadow space, and rsp back on 16
+    invoke(PostQuitMessage, 0)
+    add rsp, 40
+    xor eax, eax
+    ret
+  on_key:
+    ; Bit 30 of lparam is set when the key was already down: a repeat.
+    bt r9, 30
+    jc pass_on
+    cmp r8, 256
+    jae pass_on
+    lea rax, window_keys_pressed
+    mov byte ptr [rax + r8], 1
+    xor eax, eax
+    ret
+  on_wheel:
+    ; The high word of wparam is the distance turned, WHEEL_DELTA (120) a notch.
+    mov rax, r8
+    shr eax, 16
+    movsx eax, ax
+    cvtsi2ss xmm0, eax
+    divss xmm0, 120.0
+    addss xmm0, window_scroll
+    movss window_scroll, xmm0
+    xor eax, eax
+    ret
+  pass_on:
+    jmp DefWindowProcA
+}
+
+; The words of the command line: --shot <path>, --time <seconds>, --mode <n>.
+window_parse_args: proc() = {
+    push rsi
+    push rdi
+    sub rsp, 40                            ; 32 shadow; entry 8 + two pushes 16 + 40 lands on 16
+    call GetCommandLineA
+    mov rsi, rax
+  next_word:
+    ; skip spaces, then look at the word
+    cmp byte ptr [rsi], ' '
+    jne look
+    inc rsi
+    jmp next_word
+  look:
+    cmp byte ptr [rsi], 0
+    je done
+    invoke(cstr_starts_with, rsi, "--shot ")
+    test eax, eax
+    jz not_shot
+    add rsi, 7
+    lea rdi, window_shot_path
+    ; up to the next space, or between quotes when it is quoted
+    mov dl, ' '
+    cmp byte ptr [rsi], '"'
+    jne copy_path
+    mov dl, '"'
+    inc rsi
+  copy_path:
+    mov al, [rsi]
+    test al, al
+    jz path_done
+    inc rsi
+    cmp al, dl
+    je path_done
+    mov [rdi], al
+    inc rdi
+    jmp copy_path
+  path_done:
+    mov byte ptr [rdi], 0
+    jmp next_word
+  not_shot:
+    invoke(cstr_starts_with, rsi, "--time ")
+    test eax, eax
+    jz not_time
+    lea rcx, [rsi + 7]
+    call parse_float
+    movss window_shot_time, xmm0
+    mov rsi, rax
+    jmp next_word
+  not_time:
+    invoke(cstr_starts_with, rsi, "--mode ")
+    test eax, eax
+    jz not_mode
+    lea rcx, [rsi + 7]
+    call parse_int
+    mov window_mode_value, eax
+    mov window_mode_given, 1
+    mov rsi, rdx
+    jmp next_word
+  not_mode:
+    ; any other word: skip it, quotes and all
+    xor edi, edi                           ; inside quotes?
+  skip:
+    mov al, [rsi]
+    test al, al
+    jz done
+    cmp al, '"'
+    jne not_quote
+    xor edi, 1
+  not_quote:
+    cmp al, ' '
+    jne skip_on
+    test edi, edi
+    jz next_word
+  skip_on:
+    inc rsi
+    jmp skip
+  done:
+    add rsp, 40
+    pop rdi
+    pop rsi
+    ret
+}
+
+; rcx: caption -> rax: the window. Creates the window, the device, its
+; immediate context, the swap chain and a render target view of its back
+; buffer.
+window_create: proc(caption: *const c8) -> HWND = {
+    push rbx
+    sub rsp, 96                            ; 12-argument calls: 32 shadow + 8 * 8; entry 8 + push 8 + 96 lands on 16
+    mov rbx, rcx                           ; the caption
+    call window_parse_args
+
+    ; win32: register a window class and create the window
+    ; ----------------------------------------------------
+    call SetProcessDPIAware
+    invoke(GetModuleHandleA, 0)
+    mov window_create_wc.hInstance, rax
+    invoke(LoadCursorA, 0, IDC_ARROW)
+    mov window_create_wc.hCursor, rax
+    invoke(RegisterClassExA, window_create_wc&)
+
+    ; The size asked for is the inside of the window; AdjustWindowRect adds
+    ; the borders. The style is 32 bits, so it goes straight into the
+    ; register it is passed in: invoke moves 64.
+    mov edx, window_create_style
+    invoke(AdjustWindowRect, window_create_rect&, rdx, 0)
+    ; Shown unless taking a --shot.
+    cmp window_shot_path[0], 0
+    jne hidden
+    or window_create_style, WS_VISIBLE
+  hidden:
+    mov eax, window_create_rect.right
+    sub eax, window_create_rect.left
+    mov r10d, window_create_rect.bottom
+    sub r10d, window_create_rect.top
+    ; rax and r10 can be stack arguments: those travel through r11.
+    mov r9d, window_create_style
+    invoke(CreateWindowExA, 0, window_create_wc.lpszClassName, rbx, r9, CW_USEDEFAULT, CW_USEDEFAULT, rax, r10, 0, 0,
+           window_create_wc.hInstance, 0)
+    test rax, rax
+    jnz created
+    invoke(print, "Failed to create the window\n")
+    invoke(ExitProcess, 1)
+  created:
+    mov window, rax
+    mov window_create_swap_desc.OutputWindow, rax
+
+    ; d3d11: create the device, its immediate context and a swap chain
+    ; ----------------------------------------------------------------
+    invoke(D3D11CreateDeviceAndSwapChain, 0, D3D_DRIVER_TYPE.D3D_DRIVER_TYPE_HARDWARE, 0, 0, window_create_feature_level&, 1,
+           D3D11_SDK_VERSION, window_create_swap_desc&, swap_chain&, device&, 0, context&)
+    test eax, eax
+    jns device_created
+    invoke(print, "Failed to create the D3D11 device\n")
+    invoke(ExitProcess, 1)
+  device_created:
+    vcall(swap_chain, IDXGISwapChainVtbl.GetBuffer, 0, IID_ID3D11Texture2D&, backbuffer&)
+    vcall(device, ID3D11DeviceVtbl.CreateRenderTargetView, backbuffer, 0, backbuffer_rtv&)
+
+    ; configure global d3d11 state
+    ; ----------------------------
+    vcall(device, ID3D11DeviceVtbl.CreateRasterizerState, window_create_raster_desc&, raster_state&)
+    vcall(context, ID3D11DeviceContextVtbl.RSSetState, raster_state)
+
+    ; the clock starts now
+    invoke(QueryPerformanceFrequency, window_perf_frequency&)
+    invoke(QueryPerformanceCounter, window_perf_start&)
+    invoke(GetCursorPos, window_last_cursor&)
+
+    mov rax, window
+    add rsp, 96
+    pop rbx
+    ret
+}
+
+; A depth buffer the size of the window: 24 bits of depth, 8 of stencil.
+window_create_depth: proc() = {
+    sub rsp, 40                            ; 32 shadow, and rsp back on 16
+    vcall(device, ID3D11DeviceVtbl.CreateTexture2D, window_depth_desc&, 0, depth_texture&)
+    vcall(device, ID3D11DeviceVtbl.CreateDepthStencilView, depth_texture, 0, depth_dsv&)
+    add rsp, 40
+    ret
+}
+
+; rcx: clear colour (4 floats)
+;
+; The start of drawing a frame into the window: the backbuffer (and depth
+; buffer, if there is one) as the render target, the whole window as the
+; viewport, both cleared. The depth clears to 1, the far plane, and the
+; stencil to 0.
+window_begin: proc(color: *const f32) = {
+    push rbx
+    sub rsp, 48                            ; ClearDepthStencilView takes 5: 32 + 8; entry 8 + push 8 + 48 lands on 16
+    mov rbx, rcx                           ; the colour: vcall's first move is into rcx
+    vcall(context, ID3D11DeviceContextVtbl.OMSetRenderTargets, 1, backbuffer_rtv&, depth_dsv)
+    vcall(context, ID3D11DeviceContextVtbl.RSSetViewports, 1, viewport&)
+    vcall(context, ID3D11DeviceContextVtbl.ClearRenderTargetView, backbuffer_rtv, rbx)
+    cmp depth_dsv, 0
+    je no_depth
+    ; The depth is a float: the fourth argument, counting `this`, so it
+    ; travels in xmm3 and the 0 in its place below is only a placeholder.
+    movss xmm3, 1.0
+    vcall(context, ID3D11DeviceContextVtbl.ClearDepthStencilView, depth_dsv,
+          D3D11_CLEAR_FLAG.D3D11_CLEAR_DEPTH | D3D11_CLEAR_FLAG.D3D11_CLEAR_STENCIL, 0, 0)
+  no_depth:
+    add rsp, 48
+    pop rbx
+    ret
+}
+
+; -> rax: 0 once the window has been closed. Hands the window's events to
+; window_proc, and works out how far the mouse moved since the last call.
+window_poll: proc() -> b32 = {
+    sub rsp, 40                            ; PeekMessageA takes 5: 32 + 8, and rsp lands on 16
+  pump:
+    invoke(PeekMessageA, window_msg&, 0, 0, 0, PM_REMOVE)
+    test eax, eax
+    jz pumped
+    cmp window_msg.message, WM_QUIT
+    jne not_quit
+    mov window_running, 0
+  not_quit:
+    invoke(TranslateMessage, window_msg&)
+    invoke(DispatchMessageA, window_msg&)
+    jmp pump
+  pumped:
+
+    ; Screen y grows downwards, so moving the mouse up is a positive dy here:
+    ; pitch up.
+    invoke(GetCursorPos, window_cursor&)
+    mov eax, window_cursor.x
+    sub eax, window_last_cursor.x
+    cvtsi2ss xmm0, eax
+    movss window_mouse_dx, xmm0
+    mov eax, window_last_cursor.y
+    sub eax, window_cursor.y
+    cvtsi2ss xmm0, eax
+    movss window_mouse_dy, xmm0
+    mov eax, window_cursor.x
+    mov window_last_cursor.x, eax
+    mov eax, window_cursor.y
+    mov window_last_cursor.y, eax
+
+    ; GetAsyncKeyState reads the whole keyboard, so keys only count while
+    ; this window has the focus; glfwGetKey only ever sees its own window's.
+    call GetForegroundWindow
+    cmp rax, window
+    je focused
+    xor eax, eax
+    mov window_mouse_dx, eax
+    mov window_mouse_dy, eax
+    mov window_scroll, eax
+  focused:
+
+    invoke(key_down, VK_ESCAPE)
+    test eax, eax
+    jz no_escape
+    invoke(DestroyWindow, window)
+  no_escape:
+
+    ; A --shot that ends before its frame is taken is a failure, not a quiet exit.
+    cmp window_running, 0
+    jne still_running
+    cmp window_shot_path[0], 0
+    je still_running
+    invoke(print, "shot: the window was closed before the picture was taken\n")
+    invoke(ExitProcess, 2)
+  still_running:
+    mov eax, window_running
+    add rsp, 40
+    ret
+}
+
+; ecx: virtual key -> eax: 1 while it is held. The top bit of
+; GetAsyncKeyState is set while a key is down, which makes the SHORT negative.
+key_down: proc(vkey: u32) -> b32 = {
+    push rbx
+    sub rsp, 32                            ; 32 shadow; entry 8 + push 8 + 32 lands on 16
+    mov ebx, ecx
+    call GetForegroundWindow
+    cmp rax, window
+    jne up
+    invoke(GetAsyncKeyState, rbx)
+    test ax, ax
+    jns up
+    mov eax, 1
+    jmp done
+  up:
+    xor eax, eax
+  done:
+    add rsp, 32
+    pop rbx
+    ret
+}
+
+; ecx: virtual key -> eax: 1 if it was pressed since the last call
+key_pressed: proc(key: u32) -> b32 = {
+    and ecx, 0xFF
+    lea rdx, window_keys_pressed
+    movzx eax, byte ptr [rdx + rcx]
+    mov byte ptr [rdx + rcx], 0
+    ret
+}
+
+; ecx: how many modes the lesson has -> eax: the current one. Tab steps
+; through them and 1..9 pick one; --mode picks the first.
+window_mode: proc(count: u32) -> u32 = {
+    push rbx
+    push rsi
+    sub rsp, 40                            ; 32 shadow; entry 8 + two pushes 16 + 40 lands on 16
+    mov esi, ecx                           ; count
+    invoke(key_pressed, VK_TAB)
+    test eax, eax
+    jz no_tab
+    mov eax, window_mode_value
+    inc eax
+    xor edx, edx
+    div esi
+    mov window_mode_value, edx
+  no_tab:
+    mov ebx, '1'
+  digits:
+    invoke(key_pressed, rbx)
+    test eax, eax
+    jz next_digit
+    mov eax, ebx
+    sub eax, '1'
+    cmp eax, esi
+    jae next_digit
+    mov window_mode_value, eax
+  next_digit:
+    inc ebx
+    cmp ebx, '9'
+    jbe digits
+    mov eax, window_mode_value
+    add rsp, 40
+    pop rsi
+    pop rbx
+    ret
+}
+
+; ecx: the mode a lesson starts in, unless --mode picked another
+window_mode_default: proc(mode: u32) = {
+    cmp window_mode_given, 0
+    jne given
+    mov window_mode_value, ecx
+  given:
+    ret
+}
+
+; -> xmm0: seconds since the window was created: what glfwGetTime is to
+; LearnOpenGL. Stopped at --time while taking a --shot.
+get_time: proc() -> f32 = {
+    sub rsp, 40                            ; 32 shadow, and rsp back on 16
+    cmp window_shot_path[0], 0
+    je running
+    movss xmm0, window_shot_time
+    jmp done
+  running:
+    invoke(QueryPerformanceCounter, window_time_now&)
+    mov rax, window_time_now
+    sub rax, window_perf_start
+    cvtsi2sd xmm0, rax
+    cvtsi2sd xmm1, window_perf_frequency
+    divsd xmm0, xmm1
+    cvtsd2ss xmm0, xmm0
+  done:
+    add rsp, 40
+    ret
+}
+
+; dxgi: show the image just drawn, waiting for the next vertical blank. While
+; taking a --shot, the third frame is saved instead, and the program ends.
+window_present: proc() = {
+    sub rsp, 40                            ; 32 shadow, and rsp back on 16
+    cmp window_shot_path[0], 0
+    je show
+    cmp window_frame, 3
+    jb show
+    invoke(window_capture, window_shot_path&)
+    invoke(ExitProcess, 0)
+  show:
+    vcall(swap_chain, IDXGISwapChainVtbl.Present, 1, 0)
+    inc window_frame
+    add rsp, 40
+    ret
+}
+
+; rcx: path. Saves the backbuffer as a PNG, through WIC.
+;
+; The backbuffer cannot be read by the CPU, so it is copied into a staging
+; texture, which can. A flip-model swap chain throws the backbuffer away on
+; Present, so this runs before it.
+window_capture: proc(path: *const c8) = {
+    push rbx
+    push rsi
+    push rdi
+    push r12
+    sub rsp, 56                            ; Map and MultiByteToWideChar take 6: 32 + 16; entry 8 + 32 + 56 lands on 16
+    mov r12, rcx                           ; the path
+
+    vcall(backbuffer, ID3D11Texture2DVtbl.GetDesc, window_capture_desc&)
+    mov window_capture_desc.Usage, D3D11_USAGE.D3D11_USAGE_STAGING
+    mov window_capture_desc.BindFlags, 0
+    mov window_capture_desc.CPUAccessFlags, D3D11_CPU_ACCESS_FLAG.D3D11_CPU_ACCESS_READ
+    mov window_capture_desc.MiscFlags, 0
+    vcall(device, ID3D11DeviceVtbl.CreateTexture2D, window_capture_desc&, 0, window_capture_staging&)
+    assert_hr()
+    vcall(context, ID3D11DeviceContextVtbl.CopyResource, window_capture_staging, backbuffer)
+    vcall(context, ID3D11DeviceContextVtbl.Map, window_capture_staging, 0, D3D11_MAP.D3D11_MAP_READ, 0, window_capture_mapped&)
+    assert_hr()
+
+    ; RGBA rows, RowPitch bytes apart, become tightly packed BGRA with alpha
+    ; forced to opaque: the format every WIC PNG encoder takes.
+    mov eax, window_capture_desc.Width
+    mul window_capture_desc.Height
+    shl rax, 2
+    invoke(VirtualAlloc, 0, rax, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+    mov window_capture_pixels, rax
+    mov rdi, rax
+    mov rsi, window_capture_mapped.pData
+    xor ebx, ebx
+  rows:
+    xor ecx, ecx
+  columns:
+    mov eax, [rsi + rcx * 4]               ; A B G R, from the top byte down
+    mov edx, eax
+    and edx, 0x00FF00                      ; G stays
+    mov r8d, eax
+    shr r8d, 16
+    and r8d, 0xFF                          ; B to the bottom
+    or edx, r8d
+    and eax, 0xFF
+    shl eax, 16                            ; R to the third byte
+    or eax, edx
+    or eax, 0xFF000000                     ; opaque
+    mov [rdi], eax
+    add rdi, 4
+    inc ecx
+    cmp ecx, window_capture_desc.Width
+    jb columns
+    mov eax, window_capture_mapped.RowPitch
+    add rsi, rax
+    inc ebx
+    cmp ebx, window_capture_desc.Height
+    jb rows
+    vcall(context, ID3D11DeviceContextVtbl.Unmap, window_capture_staging, 0)
+    release(window_capture_staging)
+
+    invoke(CoInitializeEx, 0, COINIT.COINIT_MULTITHREADED)
+    invoke(CoCreateInstance, CLSID_WICImagingFactory2&, 0, CLSCTX.CLSCTX_INPROC_SERVER, IID_IWICImagingFactory&, window_capture_wic&)
+    assert_hr()
+    invoke(MultiByteToWideChar, CP_UTF8, 0, r12, -1, window_capture_wide&, 260)
+    vcall(window_capture_wic, IWICImagingFactoryVtbl.CreateStream, window_capture_stream&)
+    vcall(window_capture_stream, IWICStreamVtbl.InitializeFromFilename, window_capture_wide&, GENERIC_WRITE)
+    test eax, eax
+    jns opened
+    invoke(print, "shot: cannot write %s\n", r12)
+    invoke(ExitProcess, 1)
+  opened:
+    vcall(window_capture_wic, IWICImagingFactoryVtbl.CreateEncoder, GUID_ContainerFormatPng&, 0, window_capture_encoder&)
+    vcall(window_capture_encoder, IWICBitmapEncoderVtbl.Initialize, window_capture_stream,
+          WICBitmapEncoderCacheOption.WICBitmapEncoderNoCache)
+    vcall(window_capture_encoder, IWICBitmapEncoderVtbl.CreateNewFrame, window_capture_frame&, window_capture_props&)
+    vcall(window_capture_frame, IWICBitmapFrameEncodeVtbl.Initialize, window_capture_props)
+    mov edx, window_capture_desc.Width
+    mov r8d, window_capture_desc.Height
+    vcall(window_capture_frame, IWICBitmapFrameEncodeVtbl.SetSize, rdx, r8)
+    ; A GUID is 16 bytes: one movups each way.
+    movups xmm0, GUID_WICPixelFormat32bppBGRA
+    movups window_capture_format, xmm0
+    vcall(window_capture_frame, IWICBitmapFrameEncodeVtbl.SetPixelFormat, window_capture_format&)
+    mov eax, window_capture_desc.Width
+    shl eax, 2
+    mov esi, eax                           ; stride
+    mul window_capture_desc.Height
+    mov ebx, eax                           ; size
+    mov edx, window_capture_desc.Height
+    vcall(window_capture_frame, IWICBitmapFrameEncodeVtbl.WritePixels, rdx, rsi, rbx, window_capture_pixels)
+    assert_hr()
+    vcall(window_capture_frame, IWICBitmapFrameEncodeVtbl.Commit)
+    vcall(window_capture_encoder, IWICBitmapEncoderVtbl.Commit)
+    assert_hr()
+    release(window_capture_frame)
+    release(window_capture_props)
+    release(window_capture_encoder)
+    release(window_capture_stream)
+    release(window_capture_wic)
+
+    add rsp, 56
+    pop r12
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+}

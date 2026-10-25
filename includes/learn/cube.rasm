@@ -1,0 +1,111 @@
+; cube: the unit cube most lessons draw
+;
+; 36 vertices, two triangles a face, counter-clockwise from outside. Each
+; vertex is a position, a normal and a texture coordinate, 32 bytes;
+; `cube_layout` describes that to the input assembler. 6.1 coordinate systems
+; introduces it.
+;
+; `cube_positions` are the ten places 6.1 scatters its cubes, which the
+; lighting lessons reuse, and cube_model builds the model matrix of the i-th.
+
+import "../d3d11.rin"
+import "../calls.rasm"
+import "../math.rasm"
+
+#define CUBE_STRIDE 32
+#define CUBE_LAYOUT_COUNT 3
+
+cube_vertices: [288]const f32 = {            ; 36 vertices of 8 floats (an array count is one number or name)
+    ; position             normal                 uv
+    ; right (+x)
+     0.5, -0.5,  0.5,     1.0,  0.0,  0.0,     0.0, 1.0,
+     0.5, -0.5, -0.5,     1.0,  0.0,  0.0,     1.0, 1.0,
+     0.5,  0.5, -0.5,     1.0,  0.0,  0.0,     1.0, 0.0,
+     0.5, -0.5,  0.5,     1.0,  0.0,  0.0,     0.0, 1.0,
+     0.5,  0.5, -0.5,     1.0,  0.0,  0.0,     1.0, 0.0,
+     0.5,  0.5,  0.5,     1.0,  0.0,  0.0,     0.0, 0.0,
+    ; left (-x)
+    -0.5, -0.5, -0.5,    -1.0,  0.0,  0.0,     0.0, 1.0,
+    -0.5, -0.5,  0.5,    -1.0,  0.0,  0.0,     1.0, 1.0,
+    -0.5,  0.5,  0.5,    -1.0,  0.0,  0.0,     1.0, 0.0,
+    -0.5, -0.5, -0.5,    -1.0,  0.0,  0.0,     0.0, 1.0,
+    -0.5,  0.5,  0.5,    -1.0,  0.0,  0.0,     1.0, 0.0,
+    -0.5,  0.5, -0.5,    -1.0,  0.0,  0.0,     0.0, 0.0,
+    ; top (+y)
+    -0.5,  0.5,  0.5,     0.0,  1.0,  0.0,     0.0, 1.0,
+     0.5,  0.5,  0.5,     0.0,  1.0,  0.0,     1.0, 1.0,
+     0.5,  0.5, -0.5,     0.0,  1.0,  0.0,     1.0, 0.0,
+    -0.5,  0.5,  0.5,     0.0,  1.0,  0.0,     0.0, 1.0,
+     0.5,  0.5, -0.5,     0.0,  1.0,  0.0,     1.0, 0.0,
+    -0.5,  0.5, -0.5,     0.0,  1.0,  0.0,     0.0, 0.0,
+    ; bottom (-y)
+    -0.5, -0.5, -0.5,     0.0, -1.0,  0.0,     0.0, 1.0,
+     0.5, -0.5, -0.5,     0.0, -1.0,  0.0,     1.0, 1.0,
+     0.5, -0.5,  0.5,     0.0, -1.0,  0.0,     1.0, 0.0,
+    -0.5, -0.5, -0.5,     0.0, -1.0,  0.0,     0.0, 1.0,
+     0.5, -0.5,  0.5,     0.0, -1.0,  0.0,     1.0, 0.0,
+    -0.5, -0.5,  0.5,     0.0, -1.0,  0.0,     0.0, 0.0,
+    ; front (+z)
+    -0.5, -0.5,  0.5,     0.0,  0.0,  1.0,     0.0, 1.0,
+     0.5, -0.5,  0.5,     0.0,  0.0,  1.0,     1.0, 1.0,
+     0.5,  0.5,  0.5,     0.0,  0.0,  1.0,     1.0, 0.0,
+    -0.5, -0.5,  0.5,     0.0,  0.0,  1.0,     0.0, 1.0,
+     0.5,  0.5,  0.5,     0.0,  0.0,  1.0,     1.0, 0.0,
+    -0.5,  0.5,  0.5,     0.0,  0.0,  1.0,     0.0, 0.0,
+    ; back (-z)
+     0.5, -0.5, -0.5,     0.0,  0.0, -1.0,     0.0, 1.0,
+    -0.5, -0.5, -0.5,     0.0,  0.0, -1.0,     1.0, 1.0,
+    -0.5,  0.5, -0.5,     0.0,  0.0, -1.0,     1.0, 0.0,
+     0.5, -0.5, -0.5,     0.0,  0.0, -1.0,     0.0, 1.0,
+    -0.5,  0.5, -0.5,     0.0,  0.0, -1.0,     1.0, 0.0,
+     0.5,  0.5, -0.5,     0.0,  0.0, -1.0,     0.0, 0.0,
+}
+
+cube_layout: [CUBE_LAYOUT_COUNT]const D3D11_INPUT_ELEMENT_DESC = {
+    { .SemanticName = "POSITION", .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32B32_FLOAT, .AlignedByteOffset = 0 },
+    { .SemanticName = "NORMAL", .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32B32_FLOAT, .AlignedByteOffset = 12 },
+    { .SemanticName = "TEXCOORD", .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32_FLOAT, .AlignedByteOffset = 24 },
+}
+
+; world space positions of our cubes
+cube_positions: [10]const vec3 = {
+    {  0.0,  0.0,   0.0 },
+    {  2.0,  5.0, -15.0 },
+    { -1.5, -2.2,  -2.5 },
+    { -3.8, -2.0, -12.3 },
+    {  2.4, -0.4,  -3.5 },
+    { -1.7,  3.0,  -7.5 },
+    {  1.3, -2.0,  -2.5 },
+    {  1.5,  2.0,  -2.5 },
+    {  1.5,  0.2,  -1.5 },
+    { -1.3,  1.0,  -1.5 },
+}
+cube_rotation_axis: const vec3 = { 1.0, 0.3, 0.5 }
+
+cube_model_translation: mat4 = {}          ; cube_model's
+
+; rcx: out mat4, edx: i (0..9) -> translate(cube_positions[i]) * rotate(radians(20 i), (1, 0.3, 0.5))
+cube_model: proc(out: *mat4, index: u32) = {
+    push rbx
+    push rsi
+    sub rsp, 40                            ; 32 shadow; entry 8 + two pushes 16 + 40 lands on 16
+    mov rbx, rcx                           ; out
+    mov esi, edx                           ; i
+    cvtsi2ss xmm0, esi
+    mulss xmm0, 20.0
+    call radians
+    movaps xmm1, xmm0                      ; the angle, the second argument
+    mov rcx, rbx
+    lea r8, cube_rotation_axis
+    call m4_rotate
+    imul eax, esi, sizeof(vec3)
+    lea rdx, cube_positions
+    add rdx, rax
+    lea rcx, cube_model_translation
+    call m4_translate
+    invoke(m4_mul, rbx, cube_model_translation&, rbx)
+    add rsp, 40
+    pop rsi
+    pop rbx
+    ret
+}

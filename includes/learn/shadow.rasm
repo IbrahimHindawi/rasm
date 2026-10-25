@@ -1,0 +1,218 @@
+; shadow: depth textures to draw shadows into and read them back from
+;
+; A shadow map is one typeless texture seen two ways: as a depth buffer
+; (D32_FLOAT) while the light's view is drawn into it, and as a float texture
+; (R32_FLOAT) while it is read.
+;
+;   create_shadow_map    a square map for a directional light (5.3.1 shadow mapping)
+;   create_depth_cube    six of them as a cube, for a point light (5.3.2 point shadows)
+;   cube_face_matrices   the six views of a cube's faces from one point (5.3.2 point shadows)
+;   shadow_bias_state    a rasterizer that pushes depth away from the light, against shadow acne
+
+import "../d3d11.rin"
+import "../calls.rasm"
+import "../macros.rasm"
+import "../math.rasm"
+import "window.rasm"
+
+shadow_map: struct = {
+    dsv: *ID3D11DepthStencilView           ; while drawing the light's view
+    srv: *ID3D11ShaderResourceView         ; while reading it
+}
+
+; The three descriptions of one kind of shadow texture. The two kinds differ
+; only in data, so each is a global, written out in full; create_shadow_texture
+; fills in the size.
+shadow_descs: struct = {
+    texture: D3D11_TEXTURE2D_DESC
+    dsv: D3D11_DEPTH_STENCIL_VIEW_DESC
+    srv: D3D11_SHADER_RESOURCE_VIEW_DESC
+}
+
+; one square, for create_shadow_map
+shadow_map_descs: shadow_descs = {
+    .texture = {
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .Format = DXGI_FORMAT.DXGI_FORMAT_R32_TYPELESS,
+        .SampleDesc = { .Count = 1 },
+        .BindFlags = D3D11_BIND_FLAG.D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_FLAG.D3D11_BIND_SHADER_RESOURCE,
+    },
+    ; drawn into as depth
+    .dsv = {
+        .Format = DXGI_FORMAT.DXGI_FORMAT_D32_FLOAT,
+        .ViewDimension = D3D11_DSV_DIMENSION.D3D11_DSV_DIMENSION_TEXTURE2D,
+    },
+    ; read as one float a texel
+    .srv = {
+        .Format = DXGI_FORMAT.DXGI_FORMAT_R32_FLOAT,
+        .ViewDimension = D3D_SRV_DIMENSION.D3D_SRV_DIMENSION_TEXTURE2D,
+        .Texture2D = { .MipLevels = 1 },
+    },
+}
+
+; six squares as a cube, for create_depth_cube
+depth_cube_descs: shadow_descs = {
+    .texture = {
+        .MipLevels = 1,
+        .ArraySize = 6,
+        .Format = DXGI_FORMAT.DXGI_FORMAT_R32_TYPELESS,
+        .SampleDesc = { .Count = 1 },
+        .BindFlags = D3D11_BIND_FLAG.D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_FLAG.D3D11_BIND_SHADER_RESOURCE,
+        .MiscFlags = D3D11_RESOURCE_MISC_FLAG.D3D11_RESOURCE_MISC_TEXTURECUBE,
+    },
+    ; drawn into as depth: one view of all six faces, which the geometry
+    ; shader picks between with SV_RenderTargetArrayIndex
+    .dsv = {
+        .Format = DXGI_FORMAT.DXGI_FORMAT_D32_FLOAT,
+        .ViewDimension = D3D11_DSV_DIMENSION.D3D11_DSV_DIMENSION_TEXTURE2DARRAY,
+        .Texture2DArray = { .ArraySize = 6 },
+    },
+    .srv = {
+        .Format = DXGI_FORMAT.DXGI_FORMAT_R32_FLOAT,
+        .ViewDimension = D3D_SRV_DIMENSION.D3D_SRV_DIMENSION_TEXTURECUBE,
+        .TextureCube = { .MipLevels = 1 },
+    },
+}
+
+create_shadow_texture_texture: *ID3D11Texture2D = {}
+
+; rcx: shadow_map, edx: size in texels, r8: shadow_descs
+create_shadow_texture: proc(out: *shadow_map, size: u32, descs: *shadow_descs) = {
+    push rbx
+    push rsi
+    sub rsp, 40                            ; 32 shadow; entry 8 + two pushes 16 + 40 lands on 16
+    mov rbx, rcx                           ; out
+    mov rsi, r8                            ; descs
+    mov [rsi].shadow_descs.texture.Width, edx
+    mov [rsi].shadow_descs.texture.Height, edx
+    lea rax, [rsi].shadow_descs.texture
+    vcall(device, ID3D11DeviceVtbl.CreateTexture2D, rax, 0, create_shadow_texture_texture&)
+    assert_hr()
+    lea rax, [rsi].shadow_descs.dsv
+    lea r10, [rbx].shadow_map.dsv          ; r10, like rax, is safe as any argument
+    vcall(device, ID3D11DeviceVtbl.CreateDepthStencilView, create_shadow_texture_texture, rax, r10)
+    assert_hr()
+    lea rax, [rsi].shadow_descs.srv
+    lea r10, [rbx].shadow_map.srv
+    vcall(device, ID3D11DeviceVtbl.CreateShaderResourceView, create_shadow_texture_texture, rax, r10)
+    assert_hr()
+    release(create_shadow_texture_texture) ; the views keep it alive
+    add rsp, 40
+    pop rsi
+    pop rbx
+    ret
+}
+
+; rcx: shadow_map, edx: size in texels
+create_shadow_map: proc(out: *shadow_map, size: u32) = {
+    lea r8, shadow_map_descs
+    jmp create_shadow_texture              ; a tail call: rcx and rdx are still in place
+}
+
+; rcx: shadow_map, edx: size of each face in texels
+create_depth_cube: proc(out: *shadow_map, size: u32) = {
+    lea r8, depth_cube_descs
+    jmp create_shadow_texture
+}
+
+; for each face: the direction it looks in, then its up
+cube_face_directions: [36]const f32 = {
+     1.0,  0.0,  0.0,    0.0, -1.0,  0.0,
+    -1.0,  0.0,  0.0,    0.0, -1.0,  0.0,
+     0.0,  1.0,  0.0,    0.0,  0.0,  1.0,
+     0.0, -1.0,  0.0,    0.0,  0.0, -1.0,
+     0.0,  0.0,  1.0,    0.0, -1.0,  0.0,
+     0.0,  0.0, -1.0,    0.0, -1.0,  0.0,
+}
+
+; scale(1, -1, 1)
+cube_face_flip: const mat4 = { .m = {
+    1.0,  0.0, 0.0, 0.0,
+    0.0, -1.0, 0.0, 0.0,
+    0.0,  0.0, 1.0, 0.0,
+    0.0,  0.0, 0.0, 1.0,
+} }
+
+; cube_face_matrices'
+cube_face_projection: mat4 = {}
+cube_face_view: mat4 = {}
+cube_face_target: vec3 = {}
+cube_face_z_near: f32 = 0.0
+cube_face_z_far: f32 = 0.0
+
+; rcx: out (six mat4), rdx: center (vec3), xmm2: z_near, xmm3: z_far
+;
+; The view-projection of each cubemap face, seen from `center`, in the order
+; +x, -x, +y, -y, +z, -z. A cubemap's faces are laid out left-handed, which a
+; right-handed look-at cannot produce. GL's bottom-up framebuffer flips every
+; rendered image and so fixes that for free; D3D's is top-down, so the face
+; projection flips y instead. That flip reverses the winding, so culling stays
+; off.
+cube_face_matrices: proc(out: *mat4, center: *const vec3, z_near: f32, z_far: f32) = {
+    push rbx
+    push rsi
+    push rdi
+    push r12
+    sub rsp, 40                            ; m4_perspective takes 5: 32 + 8; entry 8 + four pushes 32 + 40 lands on 16
+    mov rdi, rcx                           ; out
+    mov r12, rdx                           ; center
+    movss cube_face_z_near, xmm2
+    movss cube_face_z_far, xmm3
+    ; projection = scale(1, -1, 1) * perspective(90 degrees, 1, near, far)
+    movss xmm0, cube_face_z_far
+    movss dword ptr [rsp + 32], xmm0       ; z_far
+    movss xmm0, 90.0
+    call radians
+    movaps xmm1, xmm0                      ; fovy
+    movss xmm2, math_one                   ; aspect
+    movss xmm3, cube_face_z_near
+    lea rcx, cube_face_projection
+    call m4_perspective
+    invoke(m4_mul, cube_face_projection&, cube_face_flip&, cube_face_projection&)
+
+    lea rsi, cube_face_directions
+    xor ebx, ebx
+  faces:
+    ; look from the center along the face's direction, with the face's up
+    lea rcx, cube_face_target
+    mov rdx, r12
+    mov r8, rsi
+    call v3_add
+    lea r9, [rsi + 12]
+    invoke(m4_look_at, cube_face_view&, r12, cube_face_target&, r9)
+    invoke(m4_mul, rdi, cube_face_projection&, cube_face_view&)
+    add rdi, sizeof(mat4)
+    add rsi, 24                            ; two vec3s a face
+    inc ebx
+    cmp ebx, 6
+    jb faces
+    add rsp, 40
+    pop r12
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+}
+
+; shadow_bias_state's: GL's conventions, as the window's, with depth pushed
+; away from the light, more on slopes seen at a grazing angle.
+shadow_bias_desc: D3D11_RASTERIZER_DESC = {
+    .FillMode = D3D11_FILL_MODE.D3D11_FILL_SOLID,
+    .CullMode = D3D11_CULL_MODE.D3D11_CULL_NONE,
+    .FrontCounterClockwise = 1,
+    .DepthBias = 1000,
+    .SlopeScaledDepthBias = 2.0,
+    .DepthClipEnable = 1,
+}
+shadow_bias_out: *ID3D11RasterizerState = {}
+
+; -> rax: ID3D11RasterizerState for shadow passes
+shadow_bias_state: proc() -> *ID3D11RasterizerState = {
+    sub rsp, 40                            ; 32 shadow, and rsp back on 16
+    vcall(device, ID3D11DeviceVtbl.CreateRasterizerState, shadow_bias_desc&, shadow_bias_out&)
+    assert_hr()
+    mov rax, shadow_bias_out
+    add rsp, 40
+    ret
+}

@@ -1,0 +1,271 @@
+; 10.1 Instancing
+;
+; Drawing the same mesh many times, each copy placed differently, in one draw
+; call. Twenty thousand rocks orbit a planet here; drawn one by one that would
+; be twenty thousand draws, each with its own constant buffer update.
+;
+; Instead every rock's model matrix goes into one more vertex buffer, marked
+; PER_INSTANCE_DATA in the input layout. The rock's own vertices are read per
+; vertex as usual; the matrix advances once per copy. DrawInstanced says how
+; many copies to make.
+;
+; A mat4 does not fit one input element (at most four floats), so it is sent
+; as four: INSTANCE0..3, one row each, put back together in the shader.
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/camera.rasm"
+import "../../../includes/learn/transforms.rasm"
+import "../../../includes/learn/model.rasm"
+
+#define AMOUNT 20000
+#define INSTANCE_LAYOUT_COUNT 7
+
+; model_layout's three per-vertex elements from slot 0, then a matrix's four
+; rows from slot 1, stepping once per instance
+instance_layout: [INSTANCE_LAYOUT_COUNT]const D3D11_INPUT_ELEMENT_DESC = {
+    { .SemanticName = "POSITION", .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32B32_FLOAT, .AlignedByteOffset = 0 },
+    { .SemanticName = "NORMAL", .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32B32_FLOAT, .AlignedByteOffset = 12 },
+    { .SemanticName = "TEXCOORD", .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32_FLOAT, .AlignedByteOffset = 24 },
+    { .SemanticName = "INSTANCE", .SemanticIndex = 0, .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32B32A32_FLOAT, .InputSlot = 1, .AlignedByteOffset = 0,
+      .InputSlotClass = D3D11_INPUT_CLASSIFICATION.D3D11_INPUT_PER_INSTANCE_DATA, .InstanceDataStepRate = 1 },
+    { .SemanticName = "INSTANCE", .SemanticIndex = 1, .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32B32A32_FLOAT, .InputSlot = 1, .AlignedByteOffset = 16,
+      .InputSlotClass = D3D11_INPUT_CLASSIFICATION.D3D11_INPUT_PER_INSTANCE_DATA, .InstanceDataStepRate = 1 },
+    { .SemanticName = "INSTANCE", .SemanticIndex = 2, .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32B32A32_FLOAT, .InputSlot = 1, .AlignedByteOffset = 32,
+      .InputSlotClass = D3D11_INPUT_CLASSIFICATION.D3D11_INPUT_PER_INSTANCE_DATA, .InstanceDataStepRate = 1 },
+    { .SemanticName = "INSTANCE", .SemanticIndex = 3, .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32B32A32_FLOAT, .InputSlot = 1, .AlignedByteOffset = 48,
+      .InputSlotClass = D3D11_INPUT_CLASSIFICATION.D3D11_INPUT_PER_INSTANCE_DATA, .InstanceDataStepRate = 1 },
+}
+
+camera_start: const vec3 = { 0.0, 12.0, 70.0 }
+y_axis: const vec3 = { 0.0, 1.0, 0.0 }
+spin_axis: const vec3 = { 0.4, 0.6, 0.8 }
+planet_scale: const vec3 = { 4.0, 4.0, 4.0 }
+clear_color: [4]const f32 = { 0.02, 0.02, 0.03, 1.0 }
+
+t: transforms = {}
+spin: mat4 = {}
+scale: mat4 = {}
+place: vec3 = {}
+planet_shader: shader = {}
+rock_shader: shader = {}
+cam: camera = {}
+planet: model = {}
+rock: model = {}
+; one mat4 per rock. masm64-dx11 pushed it onto the arena; its size is known
+; before the program runs, so here it is an array.
+matrices: [AMOUNT]mat4 = {}
+instance_buffer: *ID3D11Buffer = {}
+transforms_buffer: *ID3D11Buffer = {}
+sampler: *ID3D11SamplerState = {}
+rock_buffers: [2]*ID3D11Buffer = {}            ; slot 0 the rock's vertices, slot 1 the matrices
+rock_strides: [2]u32 = { sizeof(model_vertex), sizeof(mat4) }
+rock_offsets: [2]u32 = { 0, 0 }
+
+; timing
+current_frame: f32 = 0.0
+delta_time: f32 = 0.0
+last_frame: f32 = 0.0
+
+; -> xmm0: a random number in 0..1, in steps of 1 / 10000
+random01: proc() -> f32 = {
+    sub rsp, 40                                ; 32 shadow, and rsp back on 16
+    call rand
+    xor edx, edx
+    mov ecx, 10000
+    div ecx
+    cvtsi2ss xmm0, edx
+    divss xmm0, 10000.0
+    add rsp, 40
+    ret
+}
+
+; -> xmm0: a random number in -1..1
+random_signed: proc() -> f32 = {
+    sub rsp, 40                                ; 32 shadow, and rsp back on 16
+    call random01
+    addss xmm0, xmm0
+    subss xmm0, math_one
+    add rsp, 40
+    ret
+}
+
+; place_rocks's: MASM's locals
+place_rocks_angle: f32 = 0.0
+place_rocks_scale: f32 = 0.0
+
+; Each rock: somewhere on a ring of radius 45, scattered by up to 6 across and
+; 1.8 up and down, scaled 0.05..0.25 and turned at random.
+place_rocks: proc() = {
+    push rbx
+    push rsi
+    sub rsp, 40                                ; 32 shadow; entry 8 + two pushes 16 + 40 lands on 16
+    invoke(srand, 7)
+    lea rsi, matrices
+    xor ebx, ebx
+  rocks:
+    ; angle = i / AMOUNT * 2 * pi
+    cvtsi2ss xmm0, ebx
+    divss xmm0, 20000.0
+    addss xmm0, xmm0
+    mulss xmm0, math_pi
+    movss place_rocks_angle, xmm0
+    ; x = sin(angle) * 45 + (random * 2 - 1) * 6
+    call sinf
+    mulss xmm0, 45.0
+    movss place.x, xmm0
+    call random_signed
+    mulss xmm0, 6.0
+    addss xmm0, place.x
+    movss place.x, xmm0
+    ; y = (random * 2 - 1) * 6 * 0.3
+    call random_signed
+    mulss xmm0, 6.0
+    mulss xmm0, 0.3
+    movss place.y, xmm0
+    ; z = cos(angle) * 45 + (random * 2 - 1) * 6
+    movss xmm0, place_rocks_angle
+    call cosf
+    mulss xmm0, 45.0
+    movss place.z, xmm0
+    call random_signed
+    mulss xmm0, 6.0
+    addss xmm0, place.z
+    movss place.z, xmm0
+    ; scale = 0.05 + random * 0.2
+    call random01
+    mulss xmm0, 0.2
+    addss xmm0, 0.05
+    movss place_rocks_scale, xmm0
+    ; spin = rotate(random * 2 * pi, (0.4, 0.6, 0.8))
+    call random01
+    addss xmm0, xmm0
+    mulss xmm0, math_pi
+    movaps xmm1, xmm0                          ; the angle, m4_rotate's second argument
+    lea rcx, spin
+    lea r8, spin_axis
+    call m4_rotate
+    ; matrices[i] = translate(x, y, z) * spin * scale
+    invoke(m4_identity, scale&)
+    movss xmm0, place_rocks_scale
+    movss scale.m[0], xmm0
+    movss scale.m[5], xmm0
+    movss scale.m[10], xmm0
+    invoke(m4_mul, spin&, spin&, scale&)
+    invoke(m4_translate, rsi, place&)
+    invoke(m4_mul, rsi, rsi, spin&)
+    add rsi, sizeof(mat4)
+    inc ebx
+    cmp ebx, AMOUNT
+    jb rocks
+    add rsp, 40
+    pop rsi
+    pop rbx
+    ret
+}
+
+main: proc() -> i32 = {
+    sub rsp, 56                                ; IASetVertexBuffers takes 6: 32 + 16, plus 8 to land on 16
+
+    invoke(window_create, "LearnD3D11")
+    call window_create_depth
+
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP)
+    mov sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 0, 1, sampler&)
+
+    invoke(shader_create, planet_shader&, "src/4.advanced_d3d11/10.1.instancing/planet.hlsl", model_layout&, MODEL_LAYOUT_COUNT)
+    invoke(shader_create, rock_shader&, "src/4.advanced_d3d11/10.1.instancing/asteroids.hlsl", instance_layout&, INSTANCE_LAYOUT_COUNT)
+    ; these two .obj files expect v up the image, so v is flipped
+    invoke(model_load, planet&, "resources/objects/planet/", "planet.obj", 1)
+    invoke(model_load, rock&, "resources/objects/rock/", "rock.obj", 1)
+    invoke(create_constant_buffer, sizeof(transforms))
+    mov transforms_buffer, rax
+
+    lea rcx, cam
+    lea rdx, camera_start
+    movss xmm2, -90.0                          ; yaw
+    movss xmm3, -10.0                          ; pitch
+    call camera_create
+    movss xmm0, 15.0
+    movss cam.speed, xmm0
+    movss xmm0, 50.0
+    movss cam.zoom, xmm0
+
+    ; every rock's matrix, in one vertex buffer read once per instance
+    call place_rocks
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, matrices&, sizeof(matrices))
+    mov instance_buffer, rax
+    mov rax, rock.vertices
+    mov rock_buffers[0], rax
+    mov rax, instance_buffer
+    mov rock_buffers[1], rax
+
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    call get_time
+    movss current_frame, xmm0
+    movss xmm1, xmm0
+    subss xmm0, last_frame
+    movss delta_time, xmm0
+    movss last_frame, xmm1
+
+    invoke(camera_process_input, cam&, delta_time&)
+
+    invoke(window_begin, clear_color&)
+    ; the ring is large: depth out to 500
+    invoke(camera_view, t.view&, cam&)
+    movss xmm0, 500.0
+    movss dword ptr [rsp + 32], xmm0           ; z_far, the fifth argument
+    movss xmm0, cam.zoom
+    call radians
+    movaps xmm1, xmm0                          ; fovy
+    cvtsi2ss xmm2, scr_width
+    cvtsi2ss xmm0, scr_height
+    divss xmm2, xmm0                           ; aspect
+    movss xmm3, 0.1                            ; z_near
+    lea rcx, t.projection
+    call m4_perspective
+    v3load_var(xmm0, cam.position)
+    v3store_var(t.view_position, xmm0)
+    invoke(bind_constants, 0, transforms_buffer)
+
+    ; the planet: turning slowly, four times its size
+    movss xmm1, current_frame
+    mulss xmm1, 0.1
+    lea rcx, spin
+    lea r8, y_axis
+    call m4_rotate
+    invoke(m4_scale, scale&, planet_scale&)
+    invoke(m4_mul, t.model&, spin&, scale&)
+    invoke(m4_normal_matrix, t.normal_matrix&, t.model&)
+    invoke(update_buffer, transforms_buffer, t&, sizeof(transforms))
+    invoke(shader_use, planet_shader&)
+    invoke(model_draw, planet&)
+
+    ; the rocks: one draw, the whole ring turning slower still
+    movss xmm1, current_frame
+    mulss xmm1, 0.02
+    lea rcx, t.model
+    lea r8, y_axis
+    call m4_rotate
+    invoke(update_buffer, transforms_buffer, t&, sizeof(transforms))
+    invoke(shader_use, rock_shader&)
+    ; rock.mtl names its only texture as map_Bump, so that is the one to show
+    invoke(bind_texture, 0, rock.normal)
+    vcall(context, ID3D11DeviceContextVtbl.IASetVertexBuffers, 0, 2, rock_buffers&, rock_strides&, rock_offsets&)
+    mov edx, rock.vertex_count                 ; a u32: into its argument register first
+    vcall(context, ID3D11DeviceContextVtbl.DrawInstanced, rdx, AMOUNT, 0, 0)
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

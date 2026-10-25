@@ -1,0 +1,98 @@
+; 4.1 Textures
+;
+; An image on a rectangle. Each vertex says where in the image it sits, its
+; texture coordinate, 0..1 across and down, and the pixel shader samples the
+; image there. Two textures are blended: the crate, with 20% of the face.
+;
+; load_texture (includes/learn/gpu.rasm) decodes the file with
+; includes/image.rasm (WIC, Windows' own codecs) into RGBA8 pixels, uploads
+; them, and has the GPU generate the mipmaps from the first level. A sampler,
+; a separate object in D3D, decides how the texture is filtered and what
+; happens past its edges: create_sampler.
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+
+; x, y, z, then u, v. D3D's texture coordinate (0, 0) is the image's
+; top-left, where GL's is its bottom-left, so nothing is flipped on load.
+rectangle_vertices: [20]const f32 = {
+    -0.5, -0.5, 0.0,   0.0, 1.0,
+     0.5, -0.5, 0.0,   1.0, 1.0,
+     0.5,  0.5, 0.0,   1.0, 0.0,
+    -0.5,  0.5, 0.0,   0.0, 0.0,
+}
+rectangle_indices: [6]const u32 = { 0, 1, 2, 0, 2, 3 }
+
+vertex_layout: [2]const D3D11_INPUT_ELEMENT_DESC = {
+    { .SemanticName = "POSITION", .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32B32_FLOAT, .AlignedByteOffset = 0 },
+    { .SemanticName = "TEXCOORD", .Format = DXGI_FORMAT.DXGI_FORMAT_R32G32_FLOAT, .AlignedByteOffset = 12 },
+}
+clear_color: [4]const f32 = { 0.2, 0.3, 0.3, 1.0 }
+
+s: shader = {}
+vb: *ID3D11Buffer = {}
+ib: *ID3D11Buffer = {}
+sampler: *ID3D11SamplerState = {}
+textures: [2]*ID3D11ShaderResourceView = {}
+stride: u32 = 20
+offset: u32 = 0
+
+main: proc() -> i32 = {
+    sub rsp, 56                            ; IASetVertexBuffers takes 6: 32 + 16, plus 8 to land on 16
+
+    invoke(window_create, "LearnD3D11")
+
+    ; A sampler: how textures are filtered and what happens past their edges.
+    ; Anisotropic filtering stays sharp on surfaces seen at a slant; wrap
+    ; repeats the image.
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP)
+    mov sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 0, 1, sampler&)
+
+    ; build and compile our shader program
+    ; ------------------------------------
+    invoke(shader_create, s&, "src/1.getting_started/4.1.textures/textures.hlsl", vertex_layout&, 2)
+
+    ; set up vertex data and textures
+    ; -------------------------------
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, rectangle_vertices&, sizeof(rectangle_vertices))
+    mov vb, rax
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_INDEX_BUFFER, rectangle_indices&, sizeof(rectangle_indices))
+    mov ib, rax
+    invoke(filesystem_path, "resources/textures/container.jpg")
+    invoke(load_texture, rax, 0)
+    mov textures[0], rax
+    invoke(filesystem_path, "resources/textures/awesomeface.png")
+    invoke(load_texture, rax, 0)
+    mov textures[1], rax                   ; an index counts elements, not bytes: textures[1] is 8 bytes in
+
+    ; render loop
+    ; -----------
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    ; render
+    ; ------
+    vcall(context, ID3D11DeviceContextVtbl.OMSetRenderTargets, 1, backbuffer_rtv&, 0)
+    vcall(context, ID3D11DeviceContextVtbl.RSSetViewports, 1, viewport&)
+    vcall(context, ID3D11DeviceContextVtbl.ClearRenderTargetView, backbuffer_rtv, clear_color&)
+
+    ; the two textures, in registers t0 and t1
+    vcall(context, ID3D11DeviceContextVtbl.PSSetShaderResources, 0, 2, textures&)
+    invoke(shader_use, s&)
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    vcall(context, ID3D11DeviceContextVtbl.IASetVertexBuffers, 0, 1, vb&, stride&, offset&)
+    vcall(context, ID3D11DeviceContextVtbl.IASetIndexBuffer, ib, DXGI_FORMAT.DXGI_FORMAT_R32_UINT, 0)
+    vcall(context, ID3D11DeviceContextVtbl.DrawIndexed, 6, 0, 0)
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

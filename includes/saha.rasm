@@ -1,0 +1,188 @@
+; saha: arena allocator
+;
+; vulkasm's arena, with the bugs in its docs/bugz.md fixed (masm64-dx11's
+; saha.asm, ported):
+;
+;   * `used` grows by exactly what each push asks for, plus its alignment
+;     padding. The pages to commit are worked out separately
+;   * alignment is applied to `cursor`, and `cursor == base + used` always holds
+;   * state lives in the arena, not in globals, so arenas can nest
+;
+; One reservation of address space, committed a page at a time as pushes reach
+; it. Freeing is moving the cursor back: arenaGetPos before some temporary
+; work, arenaSetPos after it. The program's one arena is `arena`; filesystem
+; and image start it on first use.
+;
+;     invoke(arenaPush, arena&, rax, 16)     ; rax = rax bytes, 16-aligned
+
+import "calls.rasm"
+import "macros.rasm"
+import "d3d11.rin"
+
+Arena: struct = {
+    base: *u8                              ; start of the reservation
+    cursor: *u8                            ; next free byte; always base + used
+    previous: *u8                          ; cursor before the last push
+    used: u64                              ; bytes handed out, padding included
+    pagesize: u64
+    npages: u64                            ; pages committed so far
+}
+
+; Address space only: nothing is committed until a push reaches it.
+#define MAX_ALLOC_SIZE 0x100000000
+
+arena: Arena = {}
+arena_init_info: SYSTEM_INFO = {}          ; arenaInit's, for the page size
+
+; rcx: value -> rax: 1 if it is a power of two
+memoryIsPowerOfTwo: proc(x: u64) -> b32 = {
+    xor eax, eax
+    test rcx, rcx
+    jz done
+    lea rdx, [rcx - 1]
+    test rdx, rcx
+    sete al
+  done:
+    ret
+}
+
+; rcx: pointer, rdx: alignment (a power of two) -> rax: pointer rounded up to it
+memoryAlignForward: proc(p: u64, alignment: u64) -> u64 = {
+    lea rax, [rcx + rdx - 1]
+    neg rdx
+    and rax, rdx
+    ret
+}
+
+; rcx: arena -> rax: its base
+arenaInit: proc(a: *Arena) -> *u8 = {
+    push rbx
+    sub rsp, 32                            ; 32 shadow; entry 8 + push 8 + 32 lands on 16
+    mov rbx, rcx
+    invoke(GetSystemInfo, arena_init_info&)
+    mov eax, arena_init_info.dwPageSize
+    mov [rbx].Arena.pagesize, rax
+    mov qword ptr [rbx].Arena.npages, 0
+    mov qword ptr [rbx].Arena.used, 0
+    invoke(VirtualAlloc, 0, MAX_ALLOC_SIZE, MEM_RESERVE, PAGE_NOACCESS)
+    assert_not_eq(rax, 0)
+    mov [rbx].Arena.base, rax
+    mov [rbx].Arena.cursor, rax
+    mov [rbx].Arena.previous, rax
+    add rsp, 32
+    pop rbx
+    ret
+}
+
+; rcx: arena, rdx: size, r8: alignment (a power of two) -> rax: the memory
+arenaPush: proc(a: *Arena, size: u64, alignment: u64) -> *void = {
+    push rbx
+    push rsi
+    push rdi
+    push r12
+    sub rsp, 40                            ; 32 shadow; entry 8 + four pushes 32 + 40 lands on 16
+    mov rbx, rcx                           ; the arena
+    mov rsi, rdx                           ; the size, then the new `used`
+    mov rdi, r8                            ; the alignment
+
+    mov rcx, rdi
+    call memoryIsPowerOfTwo
+    assert_not_eq(rax, 0)
+
+    ; the aligned start, and where the cursor ends up
+    mov rax, [rbx].Arena.cursor
+    lea rax, [rax + rdi - 1]
+    mov rdx, rdi
+    neg rdx
+    and rax, rdx
+    mov r12, rax                           ; aligned
+    add rax, rsi
+    sub rax, [rbx].Arena.base
+    mov rsi, rax                           ; new used
+
+    ; commit more pages when the push runs past the committed ones
+    mov rax, [rbx].Arena.npages
+    mul [rbx].Arena.pagesize
+    cmp rsi, rax
+    jbe committed
+    mov rax, rsi
+    mov r8, [rbx].Arena.pagesize
+    lea rax, [rax + r8 - 1]
+    xor edx, edx
+    div r8                                 ; pages = ceil(new_used / pagesize)
+    mov [rbx].Arena.npages, rax
+    mul r8
+    mov rdx, MAX_ALLOC_SIZE
+    cmp rax, rdx
+    jbe fits
+    int 3                                  ; out of reserved address space
+  fits:
+    invoke(VirtualAlloc, [rbx].Arena.base, rax, MEM_COMMIT, PAGE_READWRITE)
+    assert_not_eq(rax, 0)
+  committed:
+
+    mov rax, [rbx].Arena.cursor
+    mov [rbx].Arena.previous, rax
+    mov [rbx].Arena.used, rsi
+    mov rax, rsi
+    add rax, [rbx].Arena.base
+    mov [rbx].Arena.cursor, rax
+    mov rax, r12
+    add rsp, 40
+    pop r12
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+}
+
+; arenaPush, then zeroes the memory: memory given back by arenaSetPos still
+; holds old data.
+arenaPushZero: proc(a: *Arena, size: u64, alignment: u64) -> *void = {
+    push rdi
+    push rsi
+    sub rsp, 40                            ; entry 8 + two pushes 16 + 40 lands on 16
+    mov rsi, rdx                           ; the size
+    call arenaPush                         ; same three arguments, still in place
+    mov rdi, rax
+    mov rcx, rsi
+    mov rdx, rax
+    xor eax, eax
+    rep stosb
+    mov rax, rdx
+    add rsp, 40
+    pop rsi
+    pop rdi
+    ret
+}
+
+; rcx: arena, rdx: a cursor from arenaGetPos -> rax: the cursor
+arenaSetPos: proc(a: *Arena, pos: *u8) -> *u8 = {
+    mov [rcx].Arena.cursor, rdx
+    mov [rcx].Arena.previous, rdx
+    mov rax, rdx
+    sub rax, [rcx].Arena.base
+    mov [rcx].Arena.used, rax
+    mov rax, rdx
+    ret
+}
+
+; pos = the arena's cursor. Both are globals: arenaGetPos(arena, saved_pos).
+arenaGetPos: macro(a, pos) = {
+    mov rax, a.cursor
+    mov pos, rax
+}
+
+; rax = count elements of type T, from the arena at address a (a 64-bit
+; register or constant count; through rax, rdx).
+arenaPushArray: macro(a, T, count, alignment) = {
+    mov rax, count
+    imul rax, rax, sizeof(T)
+    invoke(arenaPush, a, rax, alignment)
+}
+
+arenaPushArrayZero: macro(a, T, count, alignment) = {
+    mov rax, count
+    imul rax, rax, sizeof(T)
+    invoke(arenaPushZero, a, rax, alignment)
+}

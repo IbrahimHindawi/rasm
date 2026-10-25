@@ -1,0 +1,158 @@
+; 6.1 Coordinate systems
+;
+; Three matrices take a vertex from the cube it belongs to all the way to the
+; screen:
+;
+;   model       the cube's own space -> the world      (where this cube is)
+;   view        the world -> the camera's space        (where the eye is)
+;   projection  the camera's space -> clip space       (the lens: perspective)
+;
+;   clip = projection * view * model * position
+;
+; Ten cubes share one vertex buffer and differ only in their model matrix. A
+; depth buffer, cleared every frame, keeps the nearest surface at each pixel
+; so the cubes hide each other correctly. D3D's depth runs 0..1 where GL's
+; runs -1..1, which is why m4_perspective differs from glm's in two entries.
+;
+; The cube's vertices are in includes/learn/cube.rasm, where every later
+; lesson finds them too.
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/cube.rasm"
+
+view_offset: const vec3 = { 0.0, 0.0, -3.0 }
+clear_color: [4]const f32 = { 0.2, 0.3, 0.3, 1.0 }
+
+; Mirrors `cbuffer object` in the shader.
+object_constants: struct = {
+    model: mat4
+    view: mat4
+    projection: mat4
+}
+
+c: object_constants = {}
+translation: mat4 = {}
+rotation: mat4 = {}
+s: shader = {}
+cube_vb: *ID3D11Buffer = {}
+sampler: *ID3D11SamplerState = {}
+constants: *ID3D11Buffer = {}
+textures: [2]*ID3D11ShaderResourceView = {}
+stride: u32 = CUBE_STRIDE
+offset: u32 = 0
+current_frame: f32 = 0.0
+
+main: proc() -> i32 = {
+    push rbx
+    sub rsp, 48                            ; IASetVertexBuffers takes 6: 32 + 16; entry 8 + push 8 + 48 lands on 16
+
+    invoke(window_create, "LearnD3D11")
+    ; A depth buffer the size of the window: 24 bits of depth, 8 of stencil (window.rasm).
+    call window_create_depth
+
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP)
+    mov sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 0, 1, sampler&)
+
+    ; build and compile our shader program
+    ; ------------------------------------
+    invoke(shader_create, s&, "src/1.getting_started/6.1.coordinate_systems/coordinate_systems.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+
+    ; set up vertex data and textures
+    ; -------------------------------
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, cube_vertices&, sizeof(cube_vertices))
+    mov cube_vb, rax
+    invoke(filesystem_path, "resources/textures/container.jpg")
+    invoke(load_texture, rax, 0)
+    mov textures[0], rax
+    invoke(filesystem_path, "resources/textures/awesomeface.png")
+    invoke(load_texture, rax, 0)
+    mov textures[1], rax
+    invoke(create_constant_buffer, sizeof(object_constants))
+    mov constants, rax
+
+    ; render loop
+    ; -----------
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    ; per-frame time logic
+    ; --------------------
+    call get_time
+    movss current_frame, xmm0
+
+    ; render
+    ; ------
+    vcall(context, ID3D11DeviceContextVtbl.OMSetRenderTargets, 1, backbuffer_rtv&, depth_dsv)
+    vcall(context, ID3D11DeviceContextVtbl.RSSetViewports, 1, viewport&)
+    vcall(context, ID3D11DeviceContextVtbl.ClearRenderTargetView, backbuffer_rtv, clear_color&)
+    ; The depth to clear to is a float: the fourth argument, counting `this`,
+    ; so it travels in xmm3, and the 0 in its place on the vcall line is only
+    ; a placeholder.
+    movss xmm3, 1.0
+    vcall(context, ID3D11DeviceContextVtbl.ClearDepthStencilView, depth_dsv,
+          D3D11_CLEAR_FLAG.D3D11_CLEAR_DEPTH | D3D11_CLEAR_FLAG.D3D11_CLEAR_STENCIL, 0, 0)
+
+    vcall(context, ID3D11DeviceContextVtbl.PSSetShaderResources, 0, 2, textures&)
+    invoke(shader_use, s&)
+    invoke(bind_constants, 0, constants)
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    vcall(context, ID3D11DeviceContextVtbl.IASetVertexBuffers, 0, 1, cube_vb&, stride&, offset&)
+
+    ; view = translate(0, 0, -3): the world moves away from the eye
+    invoke(m4_translate, c.view&, view_offset&)
+    ; projection = perspective(45 degrees, width / height, 0.1, 100)
+    movss xmm0, 100.0
+    movss dword ptr [rsp + 32], xmm0       ; z_far, the fifth argument, on the stack
+    movss xmm0, 45.0
+    call radians
+    movaps xmm1, xmm0                      ; fovy
+    cvtsi2ss xmm2, scr_width
+    cvtsi2ss xmm0, scr_height
+    divss xmm2, xmm0                       ; aspect
+    movss xmm3, 0.1                        ; z_near
+    lea rcx, c.projection
+    call m4_perspective
+
+    xor ebx, ebx
+  cubes:
+    ; angle = radians(20 * i), and every third cube spins with time
+    cvtsi2ss xmm0, ebx
+    mulss xmm0, 20.0
+    call radians
+    mov eax, ebx
+    xor edx, edx
+    mov ecx, 3
+    div ecx
+    test edx, edx
+    jnz still
+    addss xmm0, current_frame
+  still:
+    ; model = translate(cube_positions[i]) * rotate(angle, (1, 0.3, 0.5))
+    movaps xmm1, xmm0
+    lea rcx, rotation
+    lea r8, cube_rotation_axis
+    call m4_rotate
+    imul eax, ebx, sizeof(vec3)
+    lea rdx, cube_positions
+    add rdx, rax
+    invoke(m4_translate, translation&, rdx)
+    invoke(m4_mul, c.model&, translation&, rotation&)
+    invoke(update_buffer, constants, c&, sizeof(object_constants))
+    vcall(context, ID3D11DeviceContextVtbl.Draw, 36, 0)
+    inc ebx
+    cmp ebx, 10
+    jb cubes
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}

@@ -1,0 +1,201 @@
+; 6. HDR
+;
+; A render target of 8-bit colour clamps everything to 0..1, so a light two
+; hundred times brighter than another can only reach "white", and the detail
+; around it is gone. Rendering into a 16-bit float target keeps the real
+; values; a last pass then squeezes them into what the screen can show. That
+; squeeze is tone mapping:
+;
+;   exposure   1 - exp(-color * exposure): like a camera's exposure, low values
+;              show the bright end of the tunnel, high values the dark end
+;
+; The tunnel has one very bright white light at the far end and three dim
+; coloured ones near the camera. Without tone mapping the far end is a flat
+; white wall; with it the wood grain shows there too.
+;
+;   Tab         tone mapping on / off (off: values clamped at 1)
+;   Up / Down   exposure
+import "../../../includes/d3d11.rin"
+import "../../../includes/calls.rasm"
+import "../../../includes/math.rasm"
+import "../../../includes/learn/window.rasm"
+import "../../../includes/learn/shader.rasm"
+import "../../../includes/learn/gpu.rasm"
+import "../../../includes/learn/cube.rasm"
+import "../../../includes/learn/camera.rasm"
+import "../../../includes/learn/transforms.rasm"
+import "../../../includes/learn/srgb.rasm"
+
+; Mirror `cbuffer lights` in lighting.hlsl and `cbuffer tone` in hdr.hlsl.
+lights_constants: struct = {
+    positions: [4]vec4
+    colors: [4]vec4
+}
+
+tone_constants: struct = {
+    exposure: f32
+    enabled: u32
+    pad: [2]u32
+}
+
+camera_start: const vec3 = { 0.0, 0.0, 1.0 }
+tunnel_center: const vec3 = { 0.0, 0.0, -25.0 }
+tunnel_size: const vec3 = { 5.0, 5.0, 55.0 }
+black: [4]const f32 = { 0.0, 0.0, 0.0, 1.0 }
+
+t: transforms = {}
+; lighting info: one bright light at the far end, three dim coloured ones near
+; the camera. masm64-dx11 kept these in two arrays and copied them into
+; `lights` at start-up; here they are the constant buffer's initialiser, and
+; only the upload is code.
+lights: lights_constants = {
+    .positions = {
+        { 0.0, 0.0, -49.5, 0.0 },
+        { -1.4, -1.9, -9.0, 0.0 },
+        { 0.0, -1.8, -4.0, 0.0 },
+        { 0.8, -1.7, -6.0, 0.0 },
+    },
+    .colors = {
+        { 200.0, 200.0, 200.0, 0.0 },
+        { 0.1, 0.0, 0.0, 0.0 },
+        { 0.0, 0.0, 0.2, 0.0 },
+        { 0.0, 0.1, 0.0, 0.0 },
+    },
+}
+tone: tone_constants = { .exposure = 1.0, .enabled = 1 }
+tunnel: mat4 = {}
+scratch: mat4 = {}
+s: shader = {}
+hdr_shader: shader = {}
+cam: camera = {}
+hdr_target: render_target = {}
+hdr_depth: *ID3D11DepthStencilView = {}
+cube_vb: *ID3D11Buffer = {}
+transforms_buffer: *ID3D11Buffer = {}
+lights_buffer: *ID3D11Buffer = {}
+tone_buffer: *ID3D11Buffer = {}
+wood: *ID3D11ShaderResourceView = {}
+sampler: *ID3D11SamplerState = {}
+
+; timing
+delta_time: f32 = 0.0
+last_frame: f32 = 0.0
+
+main: proc() -> i32 = {
+    sub rsp, 40                            ; 5-argument calls (draw_vertices, ClearDepthStencilView): 32 + 8, and 8 + 40 lands on 16
+
+    invoke(window_create, "LearnD3D11  (Tab: tone mapping on / off, Up / Down: exposure)")
+    ; The back buffer is viewed as sRGB: what the shaders write is linear, and
+    ; the view gamma-encodes it on the way in (5.2).
+    call window_use_srgb
+
+    invoke(create_sampler, D3D11_FILTER.D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_MODE.D3D11_TEXTURE_ADDRESS_WRAP)
+    mov sampler, rax
+    vcall(context, ID3D11DeviceContextVtbl.PSSetSamplers, 0, 1, sampler&)
+
+    ; build and compile shaders
+    ; -------------------------
+    invoke(shader_create, s&, "src/5.advanced_lighting/6.hdr/lighting.hlsl", cube_layout&, CUBE_LAYOUT_COUNT)
+    invoke(shader_create, hdr_shader&, "src/5.advanced_lighting/6.hdr/hdr.hlsl", 0, 0)
+
+    ; set up vertex data and textures
+    ; -------------------------------
+    invoke(create_buffer, D3D11_BIND_FLAG.D3D11_BIND_VERTEX_BUFFER, cube_vertices&, sizeof(cube_vertices))
+    mov cube_vb, rax
+    invoke(create_constant_buffer, sizeof(transforms))
+    mov transforms_buffer, rax
+    invoke(create_constant_buffer, sizeof(lights_constants))
+    mov lights_buffer, rax
+    invoke(create_constant_buffer, sizeof(tone_constants))
+    mov tone_buffer, rax
+    invoke(filesystem_path, "resources/textures/wood.png")
+    invoke(load_texture, rax, 1)
+    mov wood, rax
+
+    lea rcx, cam
+    lea rdx, camera_start
+    movss xmm2, -90.0                      ; yaw
+    xorps xmm3, xmm3                       ; pitch 0
+    call camera_create
+
+    ; configure floating point framebuffer
+    ; ------------------------------------
+    invoke(create_render_target, hdr_target&, SCR_WIDTH, SCR_HEIGHT, DXGI_FORMAT.DXGI_FORMAT_R16G16B16A16_FLOAT, 1)
+    invoke(create_depth_buffer, SCR_WIDTH, SCR_HEIGHT, 1)
+    mov hdr_depth, rax
+
+    ; lighting info
+    ; -------------
+    invoke(update_buffer, lights_buffer, lights&, sizeof(lights_constants))
+
+    ; the tunnel: a long box around the camera, seen from inside
+    invoke(m4_translate, tunnel&, tunnel_center&)
+    invoke(m4_scale, scratch&, tunnel_size&)
+    invoke(m4_mul, tunnel&, tunnel&, scratch&)
+
+  render_loop:
+    call window_poll
+    test eax, eax
+    jz render_loop_done
+
+    call get_time
+    movss xmm1, xmm0
+    subss xmm0, last_frame
+    movss delta_time, xmm0
+    movss last_frame, xmm1
+
+    invoke(camera_process_input, cam&, delta_time&)
+    ; mode 0 tone maps, mode 1 shows the values clamped
+    invoke(window_mode, 2)
+    mov ecx, 1
+    sub ecx, eax
+    mov tone.enabled, ecx
+    invoke(key_down, VK_UP)
+    test eax, eax
+    jz not_up
+    movss xmm0, tone.exposure
+    addss xmm0, delta_time
+    movss tone.exposure, xmm0
+  not_up:
+    invoke(key_down, VK_DOWN)
+    test eax, eax
+    jz not_down
+    movss xmm0, tone.exposure
+    subss xmm0, delta_time
+    maxss xmm0, 0.01                       ; never quite 0
+    movss tone.exposure, xmm0
+  not_down:
+
+    ; 1. render scene into floating point framebuffer
+    ; -----------------------------------------------
+    call unbind_textures
+    vcall(context, ID3D11DeviceContextVtbl.OMSetRenderTargets, 1, hdr_target.rtv&, hdr_depth)
+    vcall(context, ID3D11DeviceContextVtbl.RSSetViewports, 1, viewport&)
+    vcall(context, ID3D11DeviceContextVtbl.ClearRenderTargetView, hdr_target.rtv, black&)
+    movss xmm3, 1.0                        ; the depth, a float: xmm3
+    vcall(context, ID3D11DeviceContextVtbl.ClearDepthStencilView, hdr_depth, D3D11_CLEAR_FLAG.D3D11_CLEAR_DEPTH, 0, 0)
+    vcall(context, ID3D11DeviceContextVtbl.IASetPrimitiveTopology, D3D11_PRIMITIVE_TOPOLOGY.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    invoke(bind_constants, 0, transforms_buffer)
+    invoke(transforms_from_camera, t&, cam&)
+    invoke(shader_use, s&)
+    invoke(bind_constants, 1, lights_buffer)
+    invoke(bind_texture, 0, wood)
+    invoke(draw_vertices, transforms_buffer, t&, cube_vb, 36, tunnel&)
+
+    ; 2. render floating point colour buffer to the screen, tone mapped
+    ; -----------------------------------------------------------------
+    ; One triangle covering the screen, made by the vertex shader from
+    ; SV_VertexID alone.
+    vcall(context, ID3D11DeviceContextVtbl.OMSetRenderTargets, 1, backbuffer_rtv&, 0)
+    invoke(update_buffer, tone_buffer, tone&, sizeof(tone_constants))
+    invoke(shader_use, hdr_shader&)
+    invoke(bind_constants, 1, tone_buffer)
+    invoke(bind_texture, 0, hdr_target.srv)
+    vcall(context, ID3D11DeviceContextVtbl.Draw, 3, 0)
+
+    call window_present
+    jmp render_loop
+  render_loop_done:
+
+    invoke(ExitProcess, 0)
+}
